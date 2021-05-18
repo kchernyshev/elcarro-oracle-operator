@@ -21,7 +21,8 @@ The following variables will be used in this quickstart:
 ```sh
 export DBNAME=<Must consist of only uppercase letters, and digits. For example: MYDB>
 export PROJECT_ID=<your GCP project id>
-export SERVICE_ACCOUNT=<fully qualified name of the compute service account to be used by El Carro (i.e. SERVICE_ACCOUNT@PROJECT_NAME.iam.gserviceaccount.com)>
+export SERVICE_ACCOUNT_ID=<The ID for the service account to be used by El Carro>
+export SERVICE_ACCOUNT=<fully qualified name of the compute service account to be used by El Carro (i.e. SERVICE_ACCOUNT_ID@PROJECT_ID.iam.gserviceaccount.com)>
 export PATH_TO_EL_CARRO_RELEASE=<the complete path to the downloaded release directory>
 export GCS_BUCKET=<your globally unique Google Cloud Storage bucket name>
 export ZONE=<for example: us-central1-a>
@@ -44,13 +45,12 @@ using [gsutil](https://cloud.google.com/storage/docs/gsutil).
 gsutil -m cp -r gs://elcarro/latest $PATH_TO_EL_CARRO_RELEASE
 ```
 
-
 [Create a new GCP project](https://cloud.google.com/resource-manager/docs/creating-managing-projects)
-or reuse an existing one to install El Carro.
+or reuse an existing one to install El Carro. GCP provides [free tier products](https://cloud.google.com/free).
+So if you are not already a GCP user, you can sign up for a free trial. :)
 
 ```sh
 gcloud projects create $PROJECT_ID [--folder [...]]
-gcloud beta billing projects link $PROJECT_ID --billing-account [...]
 ```
 
 Set gcloud config project to $PROJECT_ID
@@ -63,6 +63,10 @@ Check gcloud config project
 gcloud config get-value project
 ```
 
+Create a new service account or reuse an existing one in your GCP project to
+install El Carro. Check out
+[Creating and Managing Service Accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts)
+if you need help creating or locating an existing service account.
 
 To get El Carro up and running, you need to do one of the following:
 
@@ -80,10 +84,6 @@ Optionally set CDB name, GKE cluster name, GKE zone
 $PATH_TO_EL_CARRO_RELEASE/deploy/install.sh --gcs_oracle_binaries_path $GCS_BUCKET --service_account $SERVICE_ACCOUNT --cdb_name $DBNAME --cluster_name $CLUSTER_NAME --gke_zone $ZONE
 ```
 
-Check out
-[Creating and Managing Service Accounts](https://cloud.google.com/iam/docs/creating-managing-service-accounts)
-if you need help creating or locating an existing service account.
-
 OR
 
 **Perform the manual install steps:**
@@ -93,6 +93,7 @@ OR
 *   Provision a kubernetes cluster. We recommend a cluster running
     Kubernetes/GKE version 1.17 or above.
 *   Deploy the El Carro Operator to your Kubernetes cluster
+*   Create an Instance (CDB) and Database (PDB) via the El Carro Operator
 
 ## Check downloaded El Carro software
 
@@ -134,7 +135,7 @@ pieces of software from Oracle's website:
     [Oracle eDelivery Cloud](https://edelivery.oracle.com).
 -   A recent PSU. The Jan 2021 PSU can be downloaded
     [here](https://support.oracle.com/epmos/faces/PatchDetail?_adf.ctrl-state=bsblgctta_4&patch_name=32228578&releaseId=600000000018520&patchId=32228578&languageId=0&platformId=226&_afrLoop=314820757336783).
--   Latest available OPatch that can be downloaded from here. We recommend
+-   Latest available OPatch that can be downloaded from [here](https://updates.oracle.com/download/6880880.html). We recommend
     choosing the following download parameters:
     -   Release: OPatch 20.0.0.0.0
     -   Platform: Linux x86_64
@@ -149,8 +150,6 @@ Cloud Build or building the image locally using Docker.
 
     ```sh
     gcloud projects create $PROJECT_ID [--folder [...]]
-    gcloud beta billing projects link $PROJECT_ID --billing-account [...]
-
     gcloud services enable container.googleapis.com anthos.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com --project $PROJECT_ID
     ```
 
@@ -158,7 +157,7 @@ Cloud Build or building the image locally using Docker.
     recommend creating a dedicated one as follows:
 
     ```sh
-    gcloud iam service-accounts create $SERVICE_ACCOUNT --project $PROJECT_ID
+    gcloud iam service-accounts create $SERVICE_ACCOUNT_ID --project $PROJECT_ID
     export PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
     gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:service-${PROJECT_NUMBER}@containerregistry.iam.gserviceaccount.com --role=roles/containerregistry.ServiceAgent
     ```
@@ -254,6 +253,10 @@ containerized database image, you can build an image locally using
 registry that your Kubernetes cluster can pull images from. You must have Docker
 installed before proceeding with a local containerized database image build.
 
+Note that in the current release, local build only works with Linux systems.
+Additional support for other operating systems like Windows, Mac OS, etc. will
+be added in future releases.
+
 1.  Copy the Oracle binaries you downloaded earlier to
     `PATH_TO_EL_CARRO_RELEASE/dbimage`
 
@@ -330,7 +333,7 @@ To provision a Kubernetes cluster on Google Kubernetes Engine (GKE), run the
 following command:
 
 ```sh
-gcloud container clusters create $CLUSTER_NAME --release-channel rapid --machine-type=n1-standard-4 --num-nodes 2 --zone $ZONE --project $PROJECT_ID --scopes gke-default,compute-rw,cloud-platform,https://www.googleapis.com/auth/dataaccessauditlogging --service-account $SERVICE_ACCUNT  --addons GcePersistentDiskCsiDriver
+gcloud container clusters create $CLUSTER_NAME --release-channel rapid --machine-type=n1-standard-4 --num-nodes 2 --zone $ZONE --project $PROJECT_ID --scopes gke-default,compute-rw,cloud-platform,https://www.googleapis.com/auth/dataaccessauditlogging --service-account $SERVICE_ACCOUNT
 ```
 
 To get the cluster ready for El Carro, create a k8s storage class and a volume
