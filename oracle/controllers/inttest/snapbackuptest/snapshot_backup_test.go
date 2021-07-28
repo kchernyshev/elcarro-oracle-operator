@@ -22,7 +22,6 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
@@ -47,23 +46,22 @@ var _ = Describe("Backup through snapshot", func() {
 	var instanceName string
 
 	BeforeEach(func() {
+		defer GinkgoRecover()
 		namespace = testhelpers.RandName("backup-snap-crd-test")
-		//namespace = "backup-snap-crd-test"
 		instanceName = "mydb"
 		k8sEnv.Init(namespace)
 	})
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			testhelpers.PrintLogs(k8sEnv.Namespace, k8sEnv.Env, []string{"manager", "dbdaemon", "oracledb"}, []string{instanceName})
-			testhelpers.PrintClusterObjects()
+			testhelpers.PrintSimpleDebugInfo(k8sEnv, instanceName, "GCLOUD")
 		}
 		k8sEnv.Close()
 	})
 
 	snapBackupTest := func(version string, edition string) {
 		It("Should create snapshot based backup then restore to instance successfully", func() {
-			log := logf.Log
+			log := logf.FromContext(nil)
 
 			By("By creating a instance")
 			testhelpers.CreateSimpleInstance(k8sEnv, instanceName, version, edition)
@@ -72,15 +70,17 @@ var _ = Describe("Backup through snapshot", func() {
 			instKey := client.ObjectKey{Namespace: namespace, Name: instanceName}
 
 			// Wait until the instance is "Ready" (requires 5+ minutes to download image)
-			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, 10*time.Minute)
+			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
 
 			// Wait until DatabaseInstanceReady = True
-			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 7*time.Minute)
+			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 10*time.Minute)
 
 			// Add test data
-			time.Sleep(10 * time.Second)
 			testhelpers.CreateSimplePDB(k8sEnv, instanceName)
 			testhelpers.InsertSimpleData(k8sEnv)
+
+			// Allow some time for the updates to reach the disk before creating a snapshot backup
+			time.Sleep(5 * time.Second)
 
 			By("By creating a snapshot based backup")
 			backupName := "snap"
@@ -133,7 +133,7 @@ var _ = Describe("Backup through snapshot", func() {
 			testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 				instKey,
 				createdInstance,
-				func(obj *runtime.Object) {
+				func(obj *client.Object) {
 					(*obj).(*v1alpha1.Instance).Spec.Restore = restoreSpec
 				})
 
@@ -142,7 +142,7 @@ var _ = Describe("Backup through snapshot", func() {
 			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.RestoreComplete, 10*time.Minute)
 
 			// Check databases are "Ready"
-			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 30*time.Second)
+			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 10*time.Minute)
 
 			//Verify if the restored instance contains the pre-backup data
 			time.Sleep(30 * time.Second)

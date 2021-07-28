@@ -10,11 +10,9 @@ spec:
   disks:
   - name: DataDisk
     size: 45Gi
-    type: pd-standard
     storageClass: "csi-gce-pd"
   - name: LogDisk
     size: 55Gi
-    type: pd-standard
     storageClass: "csi-gce-pd"
   services:
     Backup: true
@@ -24,7 +22,9 @@ spec:
   images:
     # Replace below with the actual URIs hosting the service agent images.
     service: "gcr.io/${PROJECT_ID}/oracle-database-images/oracle-12.2-ee-seeded-${DB}"
-  minMemoryForDBContainer: 4.0Gi
+  databaseResources:
+    requests:
+      memory: 4.0Gi
 
   dbNetworkServiceOptions:
     gcp:

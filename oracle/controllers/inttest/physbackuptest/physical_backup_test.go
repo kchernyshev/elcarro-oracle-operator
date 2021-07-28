@@ -22,9 +22,9 @@ import (
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
@@ -55,8 +55,14 @@ var _ = AfterSuite(func() {
 
 var _ = Describe("Instance and Database provisioning", func() {
 	var namespace string
+	dbResource := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("7Gi"),
+		},
+	}
 
 	BeforeEach(func() {
+		defer GinkgoRecover()
 		namespace = testhelpers.RandName("physical-backup-test")
 		k8sEnv.Init(namespace)
 
@@ -66,10 +72,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			testhelpers.PrintLogs(k8sEnv.Namespace, k8sEnv.Env,
-				[]string{"manager", "dbdaemon", "oracledb"},
-				[]string{"mydb"})
-			testhelpers.PrintClusterObjects()
+			testhelpers.PrintSimpleDebugInfo(k8sEnv, "mydb", "GCLOUD")
 		}
 		k8sEnv.Close()
 	})
@@ -77,7 +80,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 	BackupTest := func(tc backupTestCase) {
 		Context(tc.contextTitle, func() {
 			It("Should create rman based backup successfully", func() {
-				log := logf.Log
+				log := logf.FromContext(nil)
 
 				By("By creating an instance")
 				instance := &v1alpha1.Instance{
@@ -91,7 +94,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 				instKey := client.ObjectKey{Namespace: namespace, Name: tc.instanceName}
 
 				// Wait until the instance is "Ready" (requires 5+ minutes to download image)
-				testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, 10*time.Minute)
+				testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
 
 				By("By letting instance DB initialize")
 				testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 10*time.Minute)
@@ -130,7 +133,7 @@ var _ = Describe("Instance and Database provisioning", func() {
 				testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 					instKey,
 					instance,
-					func(obj *runtime.Object) {
+					func(obj *client.Object) {
 						instanceToUpdate := (*obj).(*v1alpha1.Instance)
 						instanceToUpdate.Spec.Restore = &v1alpha1.RestoreSpec{
 							BackupType:  createdBackup.Spec.Type,
@@ -170,8 +173,8 @@ var _ = Describe("Instance and Database provisioning", func() {
 							Size: resource.MustParse("150Gi"),
 						},
 					},
-					Images:                  map[string]string{},
-					MinMemoryForDBContainer: "7.0Gi",
+					Images:            map[string]string{},
+					DatabaseResources: dbResource,
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -221,8 +224,8 @@ var _ = Describe("Instance and Database provisioning", func() {
 							Size: resource.MustParse("100Gi"),
 						},
 					},
-					Images:                  map[string]string{},
-					MinMemoryForDBContainer: "7.0Gi",
+					Images:            map[string]string{},
+					DatabaseResources: dbResource,
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -267,8 +270,8 @@ var _ = Describe("Instance and Database provisioning", func() {
 							Size: resource.MustParse("150Gi"),
 						},
 					},
-					Images:                  map[string]string{},
-					MinMemoryForDBContainer: "7.0Gi",
+					Images:            map[string]string{},
+					DatabaseResources: dbResource,
 				},
 			},
 			backupSpec: v1alpha1.BackupSpec{
@@ -292,6 +295,13 @@ var _ = Describe("Instance and Database provisioning", func() {
 			testCase.instanceSpec.Version = "18c"
 			testCase.instanceSpec.Images = map[string]string{
 				"service": testhelpers.TestImageForVersion("18c", "XE", ""),
+			}
+			BackupTest(testCase)
+		})
+		Context("Oracle 19.3 EE", func() {
+			testCase.instanceSpec.Version = "19.3"
+			testCase.instanceSpec.Images = map[string]string{
+				"service": testhelpers.TestImageForVersion("19.3", "EE", ""),
 			}
 			BackupTest(testCase)
 		})

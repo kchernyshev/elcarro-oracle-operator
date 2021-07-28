@@ -4,11 +4,11 @@ package oracle
 
 import (
 	context "context"
-	empty "github.com/golang/protobuf/ptypes/empty"
 	longrunning "google.golang.org/genproto/googleapis/longrunning"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 // This is a compile-time assertion to ensure that this generated file
@@ -88,7 +88,7 @@ type DatabaseDaemonClient interface {
 	// DeleteOperation deletes a long-running operation. This method indicates
 	// that the client is no longer interested in the operation result. It does
 	// not cancel the operation.
-	DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*empty.Empty, error)
+	DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// RecoverConfigFile creates a binary pfile from the backed up spfile
 	RecoverConfigFile(ctx context.Context, in *RecoverConfigFileRequest, opts ...grpc.CallOption) (*RecoverConfigFileResponse, error)
 	// DownloadDirectoryFromGCS downloads a directory from GCS bucket to local
@@ -96,6 +96,10 @@ type DatabaseDaemonClient interface {
 	DownloadDirectoryFromGCS(ctx context.Context, in *DownloadDirectoryFromGCSRequest, opts ...grpc.CallOption) (*DownloadDirectoryFromGCSResponse, error)
 	// FetchServiceImageMetaData returns the service image metadata.
 	FetchServiceImageMetaData(ctx context.Context, in *FetchServiceImageMetaDataRequest, opts ...grpc.CallOption) (*FetchServiceImageMetaDataResponse, error)
+	// CreateFile creates file based on file path and content.
+	CreateFile(ctx context.Context, in *CreateFileRequest, opts ...grpc.CallOption) (*CreateFileResponse, error)
+	// BootstrapDatabase bootstraps seeded database by executing init_oracle
+	BootstrapDatabase(ctx context.Context, in *BootstrapDatabaseRequest, opts ...grpc.CallOption) (*BootstrapDatabaseResponse, error)
 }
 
 type databaseDaemonClient struct {
@@ -349,8 +353,8 @@ func (c *databaseDaemonClient) GetOperation(ctx context.Context, in *longrunning
 	return out, nil
 }
 
-func (c *databaseDaemonClient) DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*empty.Empty, error) {
-	out := new(empty.Empty)
+func (c *databaseDaemonClient) DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/DeleteOperation", in, out, opts...)
 	if err != nil {
 		return nil, err
@@ -379,6 +383,24 @@ func (c *databaseDaemonClient) DownloadDirectoryFromGCS(ctx context.Context, in 
 func (c *databaseDaemonClient) FetchServiceImageMetaData(ctx context.Context, in *FetchServiceImageMetaDataRequest, opts ...grpc.CallOption) (*FetchServiceImageMetaDataResponse, error) {
 	out := new(FetchServiceImageMetaDataResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/FetchServiceImageMetaData", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *databaseDaemonClient) CreateFile(ctx context.Context, in *CreateFileRequest, opts ...grpc.CallOption) (*CreateFileResponse, error) {
+	out := new(CreateFileResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateFile", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *databaseDaemonClient) BootstrapDatabase(ctx context.Context, in *BootstrapDatabaseRequest, opts ...grpc.CallOption) (*BootstrapDatabaseResponse, error) {
+	out := new(BootstrapDatabaseResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/BootstrapDatabase", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +479,7 @@ type DatabaseDaemonServer interface {
 	// DeleteOperation deletes a long-running operation. This method indicates
 	// that the client is no longer interested in the operation result. It does
 	// not cancel the operation.
-	DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*empty.Empty, error)
+	DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*emptypb.Empty, error)
 	// RecoverConfigFile creates a binary pfile from the backed up spfile
 	RecoverConfigFile(context.Context, *RecoverConfigFileRequest) (*RecoverConfigFileResponse, error)
 	// DownloadDirectoryFromGCS downloads a directory from GCS bucket to local
@@ -465,6 +487,10 @@ type DatabaseDaemonServer interface {
 	DownloadDirectoryFromGCS(context.Context, *DownloadDirectoryFromGCSRequest) (*DownloadDirectoryFromGCSResponse, error)
 	// FetchServiceImageMetaData returns the service image metadata.
 	FetchServiceImageMetaData(context.Context, *FetchServiceImageMetaDataRequest) (*FetchServiceImageMetaDataResponse, error)
+	// CreateFile creates file based on file path and content.
+	CreateFile(context.Context, *CreateFileRequest) (*CreateFileResponse, error)
+	// BootstrapDatabase bootstraps seeded database by executing init_oracle
+	BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error)
 	mustEmbedUnimplementedDatabaseDaemonServer()
 }
 
@@ -553,7 +579,7 @@ func (UnimplementedDatabaseDaemonServer) ListOperations(context.Context, *longru
 func (UnimplementedDatabaseDaemonServer) GetOperation(context.Context, *longrunning.GetOperationRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetOperation not implemented")
 }
-func (UnimplementedDatabaseDaemonServer) DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*empty.Empty, error) {
+func (UnimplementedDatabaseDaemonServer) DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteOperation not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) RecoverConfigFile(context.Context, *RecoverConfigFileRequest) (*RecoverConfigFileResponse, error) {
@@ -564,6 +590,12 @@ func (UnimplementedDatabaseDaemonServer) DownloadDirectoryFromGCS(context.Contex
 }
 func (UnimplementedDatabaseDaemonServer) FetchServiceImageMetaData(context.Context, *FetchServiceImageMetaDataRequest) (*FetchServiceImageMetaDataResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method FetchServiceImageMetaData not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) CreateFile(context.Context, *CreateFileRequest) (*CreateFileResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateFile not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BootstrapDatabase not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) mustEmbedUnimplementedDatabaseDaemonServer() {}
 
@@ -1136,6 +1168,42 @@ func _DatabaseDaemon_FetchServiceImageMetaData_Handler(srv interface{}, ctx cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_CreateFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateFileRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).CreateFile(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/CreateFile",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).CreateFile(ctx, req.(*CreateFileRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DatabaseDaemon_BootstrapDatabase_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BootstrapDatabaseRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).BootstrapDatabase(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/BootstrapDatabase",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).BootstrapDatabase(ctx, req.(*BootstrapDatabaseRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DatabaseDaemon_ServiceDesc is the grpc.ServiceDesc for DatabaseDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1266,6 +1334,14 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "FetchServiceImageMetaData",
 			Handler:    _DatabaseDaemon_FetchServiceImageMetaData_Handler,
+		},
+		{
+			MethodName: "CreateFile",
+			Handler:    _DatabaseDaemon_CreateFile_Handler,
+		},
+		{
+			MethodName: "BootstrapDatabase",
+			Handler:    _DatabaseDaemon_BootstrapDatabase_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

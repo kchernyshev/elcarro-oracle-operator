@@ -8,7 +8,6 @@ go_library(
     deps = [
         "//oracle/pkg/agents/consts",
         "//oracle/pkg/agents/oracle",
-        "//oracle/pkg/database/common",
         "//oracle/pkg/database/provision",
         "@com_github_godror_godror//:godror",
         "@io_k8s_klog_v2//:klog",
@@ -27,4 +26,18 @@ go_test(
         "@org_golang_google_grpc//:go_default_library",
         "@org_golang_google_grpc//test/bufconn",
     ],
+)
+
+filegroup(
+    name = "package-srcs",
+    srcs = glob(["**"]),
+    tags = ["automanaged"],
+    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "all-srcs",
+    srcs = [":package-srcs"],
+    tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

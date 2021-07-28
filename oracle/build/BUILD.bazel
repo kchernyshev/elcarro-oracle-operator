@@ -21,6 +21,7 @@ container_image(
     directory = "agent_repo",
     files = [
         "//oracle/cmd/dbdaemon",
+        "//oracle/cmd/dbdaemon:init_dbdaemon_files",
         "//oracle/cmd/dbdaemon_proxy",
         "//oracle/cmd/init_oracle",
         "//oracle/cmd/init_oracle:init_oracle_files",
@@ -81,6 +82,8 @@ container_image(
         "//oracle/cmd/logging",
     ],
     symlinks = {"/logging_main": "/logging"},
+    user = "54321:54322",  # oracle:dba,
+    workdir = "/home/oracle",
 )
 
 container_push(
@@ -111,4 +114,18 @@ container_push(
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/monitoring",
     tag = TAG,
+)
+
+filegroup(
+    name = "package-srcs",
+    srcs = glob(["**"]),
+    tags = ["automanaged"],
+    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "all-srcs",
+    srcs = [":package-srcs"],
+    tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

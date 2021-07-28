@@ -28,6 +28,8 @@ service ConfigAgent {
   rpc CreateCDBUser(CreateCDBUserRequest) returns (CreateCDBUserResponse) {}
   rpc UsersChanged(UsersChangedRequest) returns (UsersChangedResponse) {}
   rpc UpdateUsers(UpdateUsersRequest) returns (UpdateUsersResponse) {}
+  rpc VerifyPhysicalBackup(VerifyPhysicalBackupRequest)
+      returns (VerifyPhysicalBackupResponse) {}
   rpc PhysicalBackup(PhysicalBackupRequest)
       returns (google.longrunning.Operation) {}
   rpc PhysicalRestore(PhysicalRestoreRequest)
@@ -179,6 +181,14 @@ message UpdateUsersRequest {
 
 message UpdateUsersResponse {}
 
+message VerifyPhysicalBackupRequest {
+  string gcs_path = 1;
+}
+
+message VerifyPhysicalBackupResponse {
+  repeated string err_msgs = 1;
+}
+
 message PhysicalBackupRequest {
   enum Type {
     UNKNOWN_TYPE = 0;
@@ -263,11 +273,17 @@ message LROInput {
 }
 
 message BootstrapDatabaseRequest {
+  enum BootstrapMode {
+    ProvisionUnseeded = 0;
+    ProvisionSeeded = 1;
+    Restore = 2;
+  }
   string cdb_name = 1;
   string version = 2;
   string host = 3;
   string db_unique_name = 4;
   string dbdomain = 5;
+  BootstrapMode mode = 6;
 }
 
 message BootstrapDatabaseResponse {}

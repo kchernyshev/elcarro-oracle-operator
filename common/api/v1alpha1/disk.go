@@ -29,12 +29,6 @@ type DiskSpec struct {
 	// +kubebuilder:validation:Enum=DataDisk;LogDisk;BackupDisk
 	Name string `json:"name"`
 
-	// Disk type.
-	// Depending on a deployment platform, DiskType may take different values.
-	// On GCP, support "HDD" and "SSD". Default to "HDD" if not specified.
-	// +optional
-	Type *DiskType `json:"type,omitempty"`
-
 	// Disk size. If not specified, the defaults are: DataDisk:"100Gi", LogDisk:"150Gi",BackupDisk:"100Gi"
 	// +optional
 	Size resource.Quantity `json:"size,omitempty"`
@@ -43,6 +37,11 @@ type DiskSpec struct {
 	// for disk provisioning.
 	// +optional
 	StorageClass string `json:"storageClass,omitempty"`
+
+	// A map of string keys and values to be stored in the annotations of the PVC.
+	// These can be read and write by external tools through Kubernetes.
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // DiskType is a type that points to the disk type

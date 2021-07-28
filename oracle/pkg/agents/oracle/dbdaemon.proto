@@ -150,6 +150,13 @@ service DatabaseDaemon {
   // FetchServiceImageMetaData returns the service image metadata.
   rpc FetchServiceImageMetaData(FetchServiceImageMetaDataRequest)
       returns (FetchServiceImageMetaDataResponse) {}
+
+  // CreateFile creates file based on file path and content.
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+
+  // BootstrapDatabase bootstraps seeded database by executing init_oracle
+  rpc BootstrapDatabase(BootstrapDatabaseRequest)
+      returns (BootstrapDatabaseResponse) {}
 }
 
 message CreateDirRequest {
@@ -447,6 +454,7 @@ message RecoverConfigFileResponse {}
 message DownloadDirectoryFromGCSRequest {
   string gcs_path = 1;
   string local_path = 2;
+  bool access_permission_check = 3;
 }
 message DownloadDirectoryFromGCSResponse {}
 
@@ -457,3 +465,16 @@ message FetchServiceImageMetaDataResponse {
   string cdb_name = 2;
   string oracle_home = 3;
 }
+
+message CreateFileRequest {
+  string path = 1;
+  string content = 2;
+}
+message CreateFileResponse {}
+
+message BootstrapDatabaseRequest {
+  string cdb_name = 1;
+  string db_domain = 2;
+}
+
+message BootstrapDatabaseResponse {}

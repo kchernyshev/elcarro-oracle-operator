@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -100,6 +100,9 @@ var _ = Describe("Backup controller", func() {
 
 		instance.Status.Conditions = k8s.Upsert(instance.Status.Conditions, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, "")
 		Expect(k8sClient.Status().Update(ctx, &instance)).Should(Succeed())
+		Eventually(func() (metav1.ConditionStatus, error) {
+			return getInstanceConditionStatus(ctx, objKey, k8s.Ready)
+		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
 		fakeClientFactory.Reset()
 	})
@@ -190,15 +193,15 @@ var _ = Describe("Backup controller", func() {
 		})
 	})
 
-	Context("New backup through RMAN", func() {
-		It("Should create RMAN backup correctly", func() {
+	Context("New backup through RMAN with VerifyExists mode", func() {
+		It("Should verify RMAN backup correctly", func() {
 			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string) error {
+			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
 				return nil
 			}
 			defer func() { preflightCheck = oldFunc }()
 
-			By("By creating a RMAN type backup of the instance")
+			By("By creating a RMAN type backup with VerifyExists mode of the instance")
 			backup := &v1alpha1.Backup{
 				ObjectMeta: metav1.ObjectMeta{
 					Namespace: Namespace,
@@ -209,32 +212,39 @@ var _ = Describe("Backup controller", func() {
 						Instance: instance.Name,
 						Type:     commonv1alpha1.BackupTypePhysical,
 					},
+					Mode:    v1alpha1.VerifyExists,
+					GcsPath: "gs://elcarro_functional_test",
 				},
 			}
 
 			objKey := client.ObjectKey{Namespace: Namespace, Name: BackupName}
 			testhelpers.K8sCreateWithRetry(k8sClient, ctx, backup)
 
-			By("By checking that physical backup are created")
+			By("By checking that a physical backup is verified")
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupReady))
-			Expect(fakeClientFactory.Caclient.PhysicalBackupCalledCnt).Should(Equal(1))
+			Expect(fakeClientFactory.Caclient.VerifyPhysicalBackupCalledCnt()).Should(BeNumerically(">=", 1))
 		})
 	})
 
 	Context("New backup through RMAN in LRO async environment", func() {
 		It("Should create RMAN backup correctly", func() {
 			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string) error {
+			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
 				return nil
 			}
-			defer func() { preflightCheck = oldFunc }()
+			oldStatusCheckInterval := statusCheckInterval
+			statusCheckInterval = interval
+			defer func() {
+				preflightCheck = oldFunc
+				statusCheckInterval = oldStatusCheckInterval
+			}()
 
 			// configure fake ConfigAgent to be in LRO mode
 			fakeConfigAgentClient := fakeClientFactory.Caclient
-			fakeConfigAgentClient.AsyncPhysicalBackup = true
-			fakeConfigAgentClient.NextGetOperationStatus = testhelpers.StatusRunning
+			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
+			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusRunning)
 
 			By("By creating a RMAN type backup of the instance")
 			backup := &v1alpha1.Backup{
@@ -260,14 +270,13 @@ var _ = Describe("Backup controller", func() {
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupInProgress))
-			Expect(fakeConfigAgentClient.PhysicalBackupCalledCnt).Should(Equal(1))
+			Expect(fakeConfigAgentClient.PhysicalBackupCalledCnt()).Should(BeNumerically(">=", 1))
 
 			By("By checking that reconciler watches backup LRO status")
-			getOperationCallsCntBefore := fakeConfigAgentClient.GetOperationCalledCnt
+			getOperationCallsCntBefore := fakeConfigAgentClient.GetOperationCalledCnt()
 
-			Expect(triggerReconcile(ctx, objKey)).Should(Succeed())
 			Eventually(func() int {
-				return fakeConfigAgentClient.GetOperationCalledCnt
+				return fakeConfigAgentClient.GetOperationCalledCnt()
 			}, timeout, interval).ShouldNot(Equal(getOperationCallsCntBefore))
 
 			var updatedBackup v1alpha1.Backup
@@ -275,18 +284,17 @@ var _ = Describe("Backup controller", func() {
 			Expect(k8s.FindCondition(updatedBackup.Status.Conditions, k8s.Ready).Reason).Should(Equal(k8s.BackupInProgress))
 
 			By("By checking that physical backup is Ready on backup LRO completion")
-			fakeConfigAgentClient.NextGetOperationStatus = testhelpers.StatusDone
-			Expect(triggerReconcile(ctx, objKey)).Should(Succeed())
+			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDone)
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupReady))
 
-			Eventually(fakeConfigAgentClient.DeleteOperationCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeConfigAgentClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 		})
 
 		It("Should mark unsuccessful RMAN backup as Failed", func() {
 			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string) error {
+			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
 				return nil
 			}
 			defer func() { preflightCheck = oldFunc }()
@@ -294,8 +302,8 @@ var _ = Describe("Backup controller", func() {
 			// configure fake ConfigAgent to be in LRO mode with a
 			// failed operation result.
 			fakeConfigAgentClient := fakeClientFactory.Caclient
-			fakeConfigAgentClient.AsyncPhysicalBackup = true
-			fakeConfigAgentClient.NextGetOperationStatus = testhelpers.StatusDoneWithError
+			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
+			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
 
 			By("By creating a RMAN type backup of the instance")
 			backup := &v1alpha1.Backup{
@@ -341,19 +349,15 @@ func getConditionReason(ctx context.Context, objKey client.ObjectKey, condType s
 	return cond.Reason, nil
 }
 
-// triggerReconcile invokes k8s reconcile action by updating
-// an irrelevant field.
-func triggerReconcile(ctx context.Context, objKey client.ObjectKey) error {
-	var backup v1alpha1.Backup
-	if err := k8sClient.Get(ctx, objKey, &backup); err != nil {
-		return err
+func getInstanceConditionStatus(ctx context.Context, objKey client.ObjectKey, condType string) (metav1.ConditionStatus, error) {
+	var instance v1alpha1.Instance
+	if err := k8sClient.Get(ctx, objKey, &instance); err != nil {
+		return "", err
 	}
 
-	backup.Spec.SectionSize++
-
-	err := k8sClient.Update(ctx, &backup)
-	if errors.IsConflict(err) {
-		return nil
+	cond := k8s.FindCondition(instance.Status.Conditions, condType)
+	if cond == nil {
+		return "", fmt.Errorf("%v condition type not found", condType)
 	}
-	return err
+	return cond.Status, nil
 }

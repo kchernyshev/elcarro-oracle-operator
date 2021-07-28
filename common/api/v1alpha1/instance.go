@@ -15,6 +15,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -107,12 +108,14 @@ type InstanceSpec struct {
 
 	// Services list the optional semi-managed services that
 	// the customers can choose from.
+	// +optional
 	Services map[Service]bool `json:"services,omitempty"`
 
-	// MinMemoryForDBContainer overrides the default safe limit for
-	// scheduling the db container without crashes due to memory pressure.
+	// Resource specification for the database container. If not specified, a
+	// default of 4.0Gi memory request will be used to safeguard the db container
+	// without crashes due to memory pressure.
 	// +optional
-	MinMemoryForDBContainer string `json:"minMemoryForDBContainer,omitempty"`
+	DatabaseResources corev1.ResourceRequirements `json:"databaseResources,omitempty"`
 
 	// MaintenanceWindow specifies the time windows during which database downtimes are allowed for maintenance.
 	// +optional
@@ -136,6 +139,10 @@ type PatchingSpec struct {
 
 // InstanceStatus defines the observed state of Instance
 type InstanceStatus struct {
+	// Phase is a summary of current state of the Instance.
+	// +optional
+	Phase InstancePhase `json:"phase,omitempty"`
+
 	// Conditions represents the latest available observations
 	// of the Instance's current state.
 	// +listType=map

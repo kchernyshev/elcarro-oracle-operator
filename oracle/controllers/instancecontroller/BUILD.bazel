@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "instance_controller.go",
         "instance_controller_parameters.go",
+        "instance_controller_restore.go",
         "instance_controller_standby.go",
     ],
     importpath = "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/instancecontroller",
@@ -24,7 +25,7 @@ go_library(
         "@go_googleapis//google/longrunning:longrunning_go_proto",
         "@io_k8s_api//apps/v1:apps",
         "@io_k8s_api//core/v1:core",
-        "@io_k8s_apimachinery//pkg/api/resource",
+        "@io_k8s_apimachinery//pkg/api/errors",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
         "@io_k8s_apimachinery//pkg/runtime",
         "@io_k8s_apimachinery//pkg/types",
@@ -45,6 +46,7 @@ go_test(
         "//common/api/v1alpha1",
         "//oracle/api/v1alpha1",
         "//oracle/controllers/testhelpers",
+        "//oracle/pkg/agents/config_agent/protos",
         "//oracle/pkg/k8s",
         "@com_github_go_logr_logr//:logr",
         "@com_github_onsi_ginkgo//:ginkgo",
@@ -57,4 +59,18 @@ go_test(
         "@io_k8s_sigs_controller_runtime//:controller-runtime",
         "@io_k8s_sigs_controller_runtime//pkg/client",
     ],
+)
+
+filegroup(
+    name = "package-srcs",
+    srcs = glob(["**"]),
+    tags = ["automanaged"],
+    visibility = ["//visibility:private"],
+)
+
+filegroup(
+    name = "all-srcs",
+    srcs = [":package-srcs"],
+    tags = ["automanaged"],
+    visibility = ["//visibility:public"],
 )

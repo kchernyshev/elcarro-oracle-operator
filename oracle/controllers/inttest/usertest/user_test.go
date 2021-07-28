@@ -24,11 +24,9 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	// Enable GCP auth for k8s client
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 
@@ -39,7 +37,6 @@ import (
 )
 
 func TestUser(t *testing.T) {
-	logf.SetLogger(zap.LoggerTo(GinkgoWriter, true))
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "User operations")
 }
@@ -65,7 +62,7 @@ var (
 		"scott":      "tiger1",
 		"proberuser": "proberpassword1",
 	}
-	log = logf.Log
+	log = logf.FromContext(nil)
 )
 
 // Initial setup before test suite.
@@ -90,13 +87,13 @@ var _ = AfterSuite(func() {
 
 var _ = Describe("User operations", func() {
 	BeforeEach(func() {
+		defer GinkgoRecover()
 		initEnvBeforeEachTest()
 	})
 
 	AfterEach(func() {
 		if CurrentGinkgoTestDescription().Failed {
-			testhelpers.PrintLogs(k8sEnv.Namespace, k8sEnv.Env, []string{"manager", "dbdaemon", "oracledb"}, []string{instanceName})
-			testhelpers.PrintClusterObjects()
+			testhelpers.PrintSimpleDebugInfo(k8sEnv, instanceName, "GCLOUD")
 		}
 		k8sEnv.Close()
 	})
@@ -107,7 +104,7 @@ var _ = Describe("User operations", func() {
 
 			// Wait until DatabaseInstanceReady = True
 			instKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: instanceName}
-			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 15*time.Minute)
+			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
 
 			// Create PDB
 			testhelpers.CreateSimplePdbWithDbObj(k8sEnv, &v1alpha1.Database{
@@ -184,7 +181,7 @@ var _ = Describe("User operations", func() {
 			testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 				objKey,
 				createdDatabase,
-				func(obj *runtime.Object) {
+				func(obj *client.Object) {
 					databaseToUpdate := (*obj).(*v1alpha1.Database)
 					databaseToUpdate.Spec.AdminPasswordGsmSecretRef = &commonv1alpha1.GsmSecretReference{
 						ProjectId: projectId,
@@ -245,7 +242,7 @@ var _ = Describe("User operations", func() {
 					Message: "",
 				}, metav1.ConditionTrue)
 				if cond != nil && syncUserCompleted {
-					logf.Log.Info("PDB", "state", cond.Reason, "SyncComplete", syncUserCompleted)
+					log.Info("PDB", "state", cond.Reason, "SyncComplete", syncUserCompleted)
 					return cond.Status
 				}
 				return metav1.ConditionUnknown

@@ -40,7 +40,6 @@ import (
 
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/database/common"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/database/provision"
 )
 
@@ -264,7 +263,6 @@ func (s *Server) BounceDatabase(ctx context.Context, req *dbdpb.BounceDatabaseRe
 
 	// Sets env to bounce a database, needed for start and shutdown.
 	os.Setenv("ORACLE_SID", reqDatabaseName)
-	os.Setenv("ORACLE_HOME", s.databaseHome)
 
 	var err error
 	shutdownEnumMap := map[string]godror.ShutdownMode{
@@ -297,7 +295,6 @@ func (s *Server) BounceDatabase(ctx context.Context, req *dbdpb.BounceDatabaseRe
 func (s *Server) runCommand(bin string, params []string) error {
 	// Sets env to bounce a database|listener.
 	os.Setenv("ORACLE_SID", s.databaseSid.val)
-	os.Setenv("ORACLE_HOME", s.databaseHome)
 
 	return s.osUtil.runCommand(bin, params)
 }
@@ -339,11 +336,15 @@ func (s *Server) BounceListener(_ context.Context, req *dbdpb.BounceListenerRequ
 
 // ProxyRunDbca execute the command to create a database instance
 func (s *Server) ProxyRunDbca(ctx context.Context, req *dbdpb.ProxyRunDbcaRequest) (*dbdpb.ProxyRunDbcaResponse, error) {
-	if err := os.Setenv("ORACLE_HOME", req.GetOracleHome()); err != nil {
-		return nil, fmt.Errorf("dbdaemon/ProxyRunDbca: set env ORACLE_HOME failed: %v", err)
-	}
 	s.databaseSid.Lock()
 	defer s.databaseSid.Unlock()
+
+	klog.InfoS("proxy/ProxyRunDbca: Removing Oracle config files softlinks...")
+	if err := provision.RemoveConfigFileLinks(req.GetOracleHome(), req.GetDatabaseName()); err != nil {
+		return nil, err
+	}
+
+	klog.InfoS("proxy/ProxyRunDbca: Running dbca...")
 	if err := s.osUtil.runCommand(dbca(req.GetOracleHome()), req.GetParams()); err != nil {
 		return nil, fmt.Errorf("dbca cmd failed: %v", err)
 	}
@@ -385,6 +386,23 @@ func (s *Server) ProxyRunNID(ctx context.Context, req *dbdpb.ProxyRunNIDRequest)
 	return &dbdpb.ProxyRunNIDResponse{}, nil
 }
 
+// ProxyRunInitOracle execute the init_oracle binary with input params
+func (s *Server) ProxyRunInitOracle(ctx context.Context, req *dbdpb.ProxyRunInitOracleRequest) (*dbdpb.ProxyRunInitOracleResponse, error) {
+	cmd := exec.Command("./agents/init_oracle",
+		req.GetParams()...)
+
+	out, err := cmd.CombinedOutput()
+	klog.Infof("proxy/ProxyRunInitOracle: init_oracle log: \n %s", string(out))
+
+	if err != nil {
+		klog.InfoS("proxy/ProxyRunInitOracle: FAIL")
+		return nil, fmt.Errorf("init_oracle failed: %v", err)
+	}
+
+	klog.InfoS("proxy/ProxyRunInitOracle: DONE")
+	return &dbdpb.ProxyRunInitOracleResponse{}, nil
+}
+
 // SetEnv moves/relink oracle config files
 func (s *Server) SetEnv(ctx context.Context, req *dbdpb.SetEnvRequest) (*dbdpb.SetEnvResponse, error) {
 	klog.InfoS("proxy/SetEnv", "req", req)
@@ -414,9 +432,7 @@ func (s *Server) SetEnv(ctx context.Context, req *dbdpb.SetEnvRequest) (*dbdpb.S
 func initializeEnvironment(s *Server, home string, dbName string) error {
 	s.databaseHome = home
 	s.databaseSid.val = dbName
-	if err := os.Setenv("ORACLE_HOME", home); err != nil {
-		return fmt.Errorf("dbdaemon/initializeEnvironment: set env ORACLE_HOME failed: %v", err)
-	}
+
 	if err := createDotEnv(home, s.version, dbName); err != nil {
 		return err
 	}
@@ -430,7 +446,7 @@ func createDotEnv(dbHome, dbVersion, dbName string) error {
 		return err
 	}
 	dotEnvFile.WriteString(fmt.Sprintf("export ORACLE_HOME=%s\n", dbHome))
-	dotEnvFile.WriteString(fmt.Sprintf("ORACLE_BASE=%s\n", common.GetSourceOracleBase(dbVersion)))
+	dotEnvFile.WriteString(fmt.Sprintf("export ORACLE_BASE=%s\n", os.Getenv("ORACLE_BASE")))
 	dotEnvFile.WriteString(fmt.Sprintf("export ORACLE_SID=%s\n", dbName))
 	dotEnvFile.WriteString(fmt.Sprintf("export PATH=%s/bin:%s/OPatch:/usr/local/bin:/usr/local/sbin:/sbin:/bin:/usr/sbin:/usr/bin:/root/bin\n", dbHome, dbHome))
 	dotEnvFile.WriteString(fmt.Sprintf("export LD_LIBRARY_PATH=%s/lib:/usr/lib\n", dbHome))
@@ -441,7 +457,7 @@ func createDotEnv(dbHome, dbVersion, dbName string) error {
 // It first gets called on a CDB provisioning and at this time
 // a PDB name is not known yet (to be supplied via a separate call).
 func New(hostname, cdbNameFromYaml string) (*Server, error) {
-	oracleHome, _, version, err := provision.FetchMetaDataFromImage(provision.MetaDataFile)
+	oracleHome, _, version, err := provision.FetchMetaDataFromImage()
 	s := &Server{hostName: hostname, osUtil: &osUtilImpl{}, databaseSid: &syncState{}, version: version}
 	if err != nil {
 		return nil, fmt.Errorf("error while fetching metadata from image: %v", err)

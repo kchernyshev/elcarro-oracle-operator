@@ -25,6 +25,13 @@ type BackupSpec struct {
 	// Backup specs that are common across all database engines.
 	commonv1alpha1.BackupSpec `json:",inline"`
 
+	// Mode specifies how this backup will be managed by the operator.
+	// if it is not set, the operator tries to create a backup based on the specifications.
+	// if it is set to VerifyExists, the operator verifies the existence of a backup.
+	// +optional
+	// +kubebuilder:validation:Enum=VerifyExists
+	Mode BackupMode `json:"mode,omitempty"`
+
 	// Backup sub-type, which is only relevant for a Physical backup type
 	// (e.g. RMAN). If omitted, the default of Instance(Level) is assumed.
 	// Supported options at this point are: Instance or Database level backups.
@@ -97,8 +104,18 @@ type BackupSpec struct {
 	// A user is to ensure proper write access to the bucket from within the
 	// Oracle Operator.
 	// +optional
+	// +kubebuilder:validation:Pattern=`^gs:\/\/.+$`
 	GcsPath string `json:"gcsPath,omitempty"`
 }
+
+// BackupMode describes how a backup be managed by the operator.
+type BackupMode string
+
+const (
+	// VerifyExists means the operator will verify the existence of a backup
+	// instead of creating a new backup.
+	VerifyExists BackupMode = "VerifyExists"
+)
 
 // BackupStatus defines the observed state of Backup.
 type BackupStatus struct {
@@ -107,6 +124,10 @@ type BackupStatus struct {
 
 	BackupID   string `json:"backupid,omitempty"`
 	BackupTime string `json:"backuptime,omitempty"`
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// +optional
+	Duration *metav1.Duration `json:"duration,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -120,6 +141,8 @@ type BackupStatus struct {
 // +kubebuilder:printcolumn:JSONPath=".status.phase",name="Phase",type="string"
 // +kubebuilder:printcolumn:JSONPath=".status.backupid",name="Backup ID",type="string"
 // +kubebuilder:printcolumn:JSONPath=".status.backuptime",name="Backup Time",type="string"
+// +kubebuilder:printcolumn:JSONPath=".status.startTime",name="Start Time",type="string"
+// +kubebuilder:printcolumn:JSONPath=".status.duration",name="Duration",type="string"
 // +kubebuilder:printcolumn:JSONPath=`.status.conditions[?(@.type=="Ready")].status`,name="ReadyStatus",type="string",priority=1
 // +kubebuilder:printcolumn:JSONPath=`.status.conditions[?(@.type=="Ready")].reason`,name="ReadyReason",type="string",priority=1
 // +kubebuilder:printcolumn:JSONPath=`.status.conditions[?(@.type=="Ready")].message`,name="ReadyMessage",type="string",priority=1

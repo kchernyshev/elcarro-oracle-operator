@@ -4,11 +4,11 @@ package protos
 
 import (
 	context "context"
-	empty "github.com/golang/protobuf/ptypes/empty"
 	longrunning "google.golang.org/genproto/googleapis/longrunning"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 // This is a compile-time assertion to ensure that this generated file
@@ -25,6 +25,7 @@ type ConfigAgentClient interface {
 	CreateCDBUser(ctx context.Context, in *CreateCDBUserRequest, opts ...grpc.CallOption) (*CreateCDBUserResponse, error)
 	UsersChanged(ctx context.Context, in *UsersChangedRequest, opts ...grpc.CallOption) (*UsersChangedResponse, error)
 	UpdateUsers(ctx context.Context, in *UpdateUsersRequest, opts ...grpc.CallOption) (*UpdateUsersResponse, error)
+	VerifyPhysicalBackup(ctx context.Context, in *VerifyPhysicalBackupRequest, opts ...grpc.CallOption) (*VerifyPhysicalBackupResponse, error)
 	PhysicalBackup(ctx context.Context, in *PhysicalBackupRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	PhysicalRestore(ctx context.Context, in *PhysicalRestoreRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	CheckStatus(ctx context.Context, in *CheckStatusRequest, opts ...grpc.CallOption) (*CheckStatusResponse, error)
@@ -39,7 +40,7 @@ type ConfigAgentClient interface {
 	// Deletes a long-running operation. This method indicates that the client is
 	// no longer interested in the operation result. It does not cancel the
 	// operation.
-	DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*empty.Empty, error)
+	DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	BootstrapDatabase(ctx context.Context, in *BootstrapDatabaseRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	BootstrapStandby(ctx context.Context, in *BootstrapStandbyRequest, opts ...grpc.CallOption) (*BootstrapStandbyResponse, error)
 	DataPumpExport(ctx context.Context, in *DataPumpExportRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
@@ -97,6 +98,15 @@ func (c *configAgentClient) UsersChanged(ctx context.Context, in *UsersChangedRe
 func (c *configAgentClient) UpdateUsers(ctx context.Context, in *UpdateUsersRequest, opts ...grpc.CallOption) (*UpdateUsersResponse, error) {
 	out := new(UpdateUsersResponse)
 	err := c.cc.Invoke(ctx, "/protos.ConfigAgent/UpdateUsers", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *configAgentClient) VerifyPhysicalBackup(ctx context.Context, in *VerifyPhysicalBackupRequest, opts ...grpc.CallOption) (*VerifyPhysicalBackupResponse, error) {
+	out := new(VerifyPhysicalBackupResponse)
+	err := c.cc.Invoke(ctx, "/protos.ConfigAgent/VerifyPhysicalBackup", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -175,8 +185,8 @@ func (c *configAgentClient) GetOperation(ctx context.Context, in *longrunning.Ge
 	return out, nil
 }
 
-func (c *configAgentClient) DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*empty.Empty, error) {
-	out := new(empty.Empty)
+func (c *configAgentClient) DeleteOperation(ctx context.Context, in *longrunning.DeleteOperationRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/protos.ConfigAgent/DeleteOperation", in, out, opts...)
 	if err != nil {
 		return nil, err
@@ -265,6 +275,7 @@ type ConfigAgentServer interface {
 	CreateCDBUser(context.Context, *CreateCDBUserRequest) (*CreateCDBUserResponse, error)
 	UsersChanged(context.Context, *UsersChangedRequest) (*UsersChangedResponse, error)
 	UpdateUsers(context.Context, *UpdateUsersRequest) (*UpdateUsersResponse, error)
+	VerifyPhysicalBackup(context.Context, *VerifyPhysicalBackupRequest) (*VerifyPhysicalBackupResponse, error)
 	PhysicalBackup(context.Context, *PhysicalBackupRequest) (*longrunning.Operation, error)
 	PhysicalRestore(context.Context, *PhysicalRestoreRequest) (*longrunning.Operation, error)
 	CheckStatus(context.Context, *CheckStatusRequest) (*CheckStatusResponse, error)
@@ -279,7 +290,7 @@ type ConfigAgentServer interface {
 	// Deletes a long-running operation. This method indicates that the client is
 	// no longer interested in the operation result. It does not cancel the
 	// operation.
-	DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*empty.Empty, error)
+	DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*emptypb.Empty, error)
 	BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*longrunning.Operation, error)
 	BootstrapStandby(context.Context, *BootstrapStandbyRequest) (*BootstrapStandbyResponse, error)
 	DataPumpExport(context.Context, *DataPumpExportRequest) (*longrunning.Operation, error)
@@ -310,6 +321,9 @@ func (UnimplementedConfigAgentServer) UsersChanged(context.Context, *UsersChange
 func (UnimplementedConfigAgentServer) UpdateUsers(context.Context, *UpdateUsersRequest) (*UpdateUsersResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UpdateUsers not implemented")
 }
+func (UnimplementedConfigAgentServer) VerifyPhysicalBackup(context.Context, *VerifyPhysicalBackupRequest) (*VerifyPhysicalBackupResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method VerifyPhysicalBackup not implemented")
+}
 func (UnimplementedConfigAgentServer) PhysicalBackup(context.Context, *PhysicalBackupRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method PhysicalBackup not implemented")
 }
@@ -334,7 +348,7 @@ func (UnimplementedConfigAgentServer) ListOperations(context.Context, *longrunni
 func (UnimplementedConfigAgentServer) GetOperation(context.Context, *longrunning.GetOperationRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetOperation not implemented")
 }
-func (UnimplementedConfigAgentServer) DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*empty.Empty, error) {
+func (UnimplementedConfigAgentServer) DeleteOperation(context.Context, *longrunning.DeleteOperationRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteOperation not implemented")
 }
 func (UnimplementedConfigAgentServer) BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*longrunning.Operation, error) {
@@ -460,6 +474,24 @@ func _ConfigAgent_UpdateUsers_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ConfigAgentServer).UpdateUsers(ctx, req.(*UpdateUsersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ConfigAgent_VerifyPhysicalBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyPhysicalBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ConfigAgentServer).VerifyPhysicalBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/protos.ConfigAgent/VerifyPhysicalBackup",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ConfigAgentServer).VerifyPhysicalBackup(ctx, req.(*VerifyPhysicalBackupRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -796,6 +828,10 @@ var ConfigAgent_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpdateUsers",
 			Handler:    _ConfigAgent_UpdateUsers_Handler,
+		},
+		{
+			MethodName: "VerifyPhysicalBackup",
+			Handler:    _ConfigAgent_VerifyPhysicalBackup_Handler,
 		},
 		{
 			MethodName: "PhysicalBackup",

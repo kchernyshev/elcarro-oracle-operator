@@ -307,10 +307,6 @@ func (d *DB) openPDBs(ctx context.Context) error {
 
 // CreatePasswordFile is a Database Daemon method to create password file.
 func (s *Server) CreatePasswordFile(ctx context.Context, req *dbdpb.CreatePasswordFileRequest) (*dbdpb.CreatePasswordFileResponse, error) {
-	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-		return nil, fmt.Errorf("failed to set env variable: %v", err)
-	}
-
 	if req.GetDatabaseName() == "" {
 		return nil, fmt.Errorf("missing database name for req: %v", req)
 	}
@@ -618,9 +614,6 @@ func (s *Server) runCommand(bin string, params []string) error {
 	if err := os.Setenv("ORACLE_SID", s.databaseSid.val); err != nil {
 		return fmt.Errorf("failed to set env variable: %v", err)
 	}
-	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-		return fmt.Errorf("failed to set env variable: %v", err)
-	}
 
 	return s.osUtil.runCommand(bin, params)
 }
@@ -750,10 +743,6 @@ func (d *DB) runQuery(ctx context.Context, sqls []string, db oracleDatabase) ([]
 }
 
 func (s *Server) runSQLPlusHelper(ctx context.Context, req *dbdpb.RunSQLPlusCMDRequest, formattedSQL bool) (*dbdpb.RunCMDResponse, error) {
-
-	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-		return nil, fmt.Errorf("failed to set env variable: %v", err)
-	}
 	if req.GetTnsAdmin() != "" {
 		if err := os.Setenv("TNS_ADMIN", req.GetTnsAdmin()); err != nil {
 			return nil, fmt.Errorf("failed to set env variable: %v", err)
@@ -943,9 +932,7 @@ func (s *Server) CheckDatabaseState(ctx context.Context, req *dbdpb.CheckDatabas
 		if err := os.Setenv("ORACLE_SID", req.GetDatabaseName()); err != nil {
 			return nil, err
 		}
-		if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-			return nil, err
-		}
+
 		// Even for CDB check, use TNS connection to verify listener health.
 		cs, pass, err := security.SetupConnStringOnServer(ctx, s, consts.SecurityUser, req.GetDatabaseName(), req.GetDbDomain())
 		if err != nil {
@@ -1003,9 +990,7 @@ func (s *Server) RunRMAN(ctx context.Context, req *dbdpb.RunRMANRequest) (*dbdpb
 	if err := os.Setenv("ORACLE_SID", s.databaseSid.val); err != nil {
 		return nil, fmt.Errorf("failed to set env variable: %v", err)
 	}
-	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-		return nil, fmt.Errorf("failed to set env variable: %v", err)
-	}
+
 	if req.GetTnsAdmin() != "" {
 		if err := os.Setenv("TNS_ADMIN", req.GetTnsAdmin()); err != nil {
 			return nil, fmt.Errorf("failed to set env variable: %v", err)
@@ -1114,9 +1099,7 @@ func (s *Server) NID(ctx context.Context, req *dbdpb.NIDRequest) (*dbdpb.NIDResp
 	if req.GetSid() == "" {
 		return nil, fmt.Errorf("dbdaemon/NID: missing sid for req: %v", req)
 	}
-	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
-		return nil, fmt.Errorf("dbdaemon/NID: set env ORACLE_HOME failed: %v", err)
-	}
+
 	if err := os.Setenv("ORACLE_SID", req.GetSid()); err != nil {
 		return nil, fmt.Errorf("dbdaemon/NID: set env ORACLE_SID failed: %v", err)
 	}
@@ -1346,22 +1329,16 @@ func (s *Server) CreateCDB(ctx context.Context, req *dbdpb.CreateCDBRequest) (*d
 	}
 	klog.InfoS("CDB created successfully")
 
-	if err := markProvisioned(); err != nil {
-		return nil, fmt.Errorf("error while creating provisioning file: %v", err)
-	}
-	klog.InfoS("Provisioning file created successfully")
-
-	if err := setEnvNew(s, s.databaseHome, req.DatabaseName); err != nil {
-		return nil, fmt.Errorf("failed to setup environment: %v", err)
-	}
-	// hack fix for new PDB listener
-	if _, err := s.runSQLPlusHelper(ctx, &dbdpb.RunSQLPlusCMDRequest{
-		Commands: []string{fmt.Sprintf("alter system set local_listener='(DESCRIPTION=(ADDRESS=(PROTOCOL=ipc)(KEY=REGLSNR_%d)))' scope=both", consts.SecureListenerPort)},
-	}, false); err != nil {
-		klog.Error(err, "set local_listener error")
-	}
-	klog.InfoS("Env setup successfully")
 	return &dbdpb.CreateCDBResponse{}, nil
+}
+
+// CreateFile creates file based on request.
+func (s *Server) CreateFile(ctx context.Context, req *dbdpb.CreateFileRequest) (*dbdpb.CreateFileResponse, error) {
+	klog.InfoS("dbdaemon/CreateFile: ", "req", req)
+	if err := s.osUtil.createFile(req.GetPath(), strings.NewReader(req.GetContent())); err != nil {
+		return nil, fmt.Errorf("dbdaemon/CreateFile: create failed: %v", err)
+	}
+	return &dbdpb.CreateFileResponse{}, nil
 }
 
 // CreateCDBAsync turns CreateCDB into an async call.
@@ -1725,10 +1702,7 @@ func New(ctx context.Context, cdbNameFromYaml string) (*Server, error) {
 		gcsUtil:        &gcsUtilImpl{},
 	}
 
-	oracleHome, _, _, err := provision.FetchMetaDataFromImage(provision.MetaDataFile)
-	if err != nil {
-		return nil, fmt.Errorf("error while fetching metadata from image: %v", err)
-	}
+	oracleHome := os.Getenv("ORACLE_HOME")
 	if err := setEnvNew(s, oracleHome, cdbNameFromYaml); err != nil {
 		return nil, fmt.Errorf("failed to setup environment: %v", err)
 	}
@@ -1744,7 +1718,12 @@ func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.Downlo
 		return nil, fmt.Errorf("failed to parse gcs path %s", err)
 	}
 
-	klog.Infof("dbdaemon/downloadDirectoryFromGCS: destination path is %s", req.GetLocalPath())
+	if req.GetAccessPermissionCheck() {
+		klog.Info("dbdaemon/downloadDirectoryFromGCS: verify the access permission of the given GCS path")
+	} else {
+		klog.Infof("dbdaemon/downloadDirectoryFromGCS: destination path is %s", req.GetLocalPath())
+	}
+
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("storage.NewClient: %v", err)
@@ -1763,8 +1742,17 @@ func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.Downlo
 		if err != nil {
 			return nil, fmt.Errorf("Bucket(%q).Objects(): %v", bucket, err)
 		}
-		if err := s.downloadFile(ctx, client, bucket, attrs.Name, prefix, req.GetLocalPath()); err != nil {
-			return nil, fmt.Errorf("failed to download file %s", err)
+
+		if req.GetAccessPermissionCheck() {
+			reader, err := client.Bucket(bucket).Object(attrs.Name).NewRangeReader(ctx, 0, 1)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read URL %s: %v", attrs.Name, err)
+			}
+			reader.Close()
+		} else {
+			if err := s.downloadFile(ctx, client, bucket, attrs.Name, prefix, req.GetLocalPath()); err != nil {
+				return nil, fmt.Errorf("failed to download file %s", err)
+			}
 		}
 	}
 	return &dbdpb.DownloadDirectoryFromGCSResponse{}, nil
@@ -1772,7 +1760,7 @@ func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.Downlo
 
 // FetchServiceImageMetaData fetches the image metadata from the image.
 func (s *Server) FetchServiceImageMetaData(ctx context.Context, req *dbdpb.FetchServiceImageMetaDataRequest) (*dbdpb.FetchServiceImageMetaDataResponse, error) {
-	oracleHome, cdbName, version, err := provision.FetchMetaDataFromImage(provision.MetaDataFile)
+	oracleHome, cdbName, version, err := provision.FetchMetaDataFromImage()
 	if err != nil {
 		return &dbdpb.FetchServiceImageMetaDataResponse{}, nil
 	}
@@ -1784,6 +1772,7 @@ func (s *Server) downloadFile(ctx context.Context, c *storage.Client, bucket, gc
 	if err != nil {
 		return fmt.Errorf("failed to read URL %s: %v", gcsPath, err)
 	}
+	defer reader.Close()
 
 	relPath, err := filepath.Rel(baseDir, gcsPath)
 	if err != nil {
@@ -1796,4 +1785,34 @@ func (s *Server) downloadFile(ctx context.Context, c *storage.Client, bucket, gc
 	}
 	klog.InfoS("dbdaemon/downloadFile:", "downloaded", f)
 	return nil
+}
+
+// BootstrapDatabase invokes init_oracle on dbdaemon_proxy to perform bootstrap tasks for seeded image
+func (s *Server) BootstrapDatabase(ctx context.Context, req *dbdpb.BootstrapDatabaseRequest) (*dbdpb.BootstrapDatabaseResponse, error) {
+	cmd := "free -m | awk '/Mem/ {print $2}'"
+	out, err := exec.Command("bash", "-c", cmd).Output()
+	if err != nil {
+		return nil, fmt.Errorf("Failed to execute command %s: %s", cmd, err)
+	}
+
+	freeMem, err := strconv.Atoi(string(out[:len(out)-1]))
+	if err != nil {
+		return nil, fmt.Errorf("Failed to convert output %s to integer: %s", string(out), err)
+	}
+
+	if _, err := s.dbdClient.ProxyRunInitOracle(ctx, &dbdpb.ProxyRunInitOracleRequest{
+		Params: []string{
+			fmt.Sprintf("--pga=%d", freeMem/8),
+			fmt.Sprintf("--sga=%d", freeMem/2),
+			fmt.Sprintf("--cdb_name=%s", req.GetCdbName()),
+			fmt.Sprintf("--db_domain=%s", req.GetDbDomain()),
+			"--logtostderr=true",
+		},
+	}); err != nil {
+		klog.InfoS("dbdaemon/BootstrapDatabase: error while run init_oracle: err", "err", err)
+		return nil, fmt.Errorf("dbdaemon/BootstrapDatabase: failed to bootstrap database due to: %v", err)
+	}
+	klog.InfoS("dbdaemon/BootstrapDatabase: bootstrap database successful")
+
+	return &dbdpb.BootstrapDatabaseResponse{}, nil
 }

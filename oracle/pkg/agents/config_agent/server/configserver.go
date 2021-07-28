@@ -157,6 +157,23 @@ func (s *ConfigServer) PhysicalRestore(ctx context.Context, req *pb.PhysicalRest
 	})
 }
 
+// VerifyPhysicalBackup verifies the existence of physical backup.
+func (s *ConfigServer) VerifyPhysicalBackup(ctx context.Context, req *pb.VerifyPhysicalBackupRequest) (*pb.VerifyPhysicalBackupResponse, error) {
+	klog.InfoS("configagent/VerifyPhysicalBackup", "req", req)
+	dbdClient, closeConn, err := newDBDClient(ctx, s)
+	if err != nil {
+		return nil, fmt.Errorf("configagent/VerifyPhysicalBackup: failed to create a database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+	if _, err := dbdClient.DownloadDirectoryFromGCS(ctx, &dbdpb.DownloadDirectoryFromGCSRequest{
+		GcsPath:               req.GetGcsPath(),
+		AccessPermissionCheck: true,
+	}); err != nil {
+		return &pb.VerifyPhysicalBackupResponse{ErrMsgs: []string{err.Error()}}, nil
+	}
+	return &pb.VerifyPhysicalBackupResponse{}, nil
+}
+
 // PhysicalBackup starts an RMAN backup and stores it in the GCS bucket provided.
 func (s *ConfigServer) PhysicalBackup(ctx context.Context, req *pb.PhysicalBackupRequest) (*lropb.Operation, error) {
 	klog.InfoS("configagent/PhysicalBackup", "req", req)
@@ -678,7 +695,7 @@ func (s *ConfigServer) BootstrapStandby(ctx context.Context, req *pb.BootstrapSt
 	return &pb.BootstrapStandbyResponse{Pdbs: migratedPDBs}, nil
 }
 
-// BootstrapDatabase bootstrap a CDB after creation.
+// BootstrapDatabase bootstrap a CDB after creation or restore.
 func (s *ConfigServer) BootstrapDatabase(ctx context.Context, req *pb.BootstrapDatabaseRequest) (*lropb.Operation, error) {
 	klog.InfoS("configagent/BootstrapDatabase", "req", req)
 
@@ -687,11 +704,50 @@ func (s *ConfigServer) BootstrapDatabase(ctx context.Context, req *pb.BootstrapD
 		return nil, fmt.Errorf("configagent/BootstrapDatabase: failed to create database daemon client: %v", err)
 	}
 	defer closeConn()
-	task := provision.NewBootstrapDatabaseTaskForUnseeded(req.CdbName, req.DbUniqueName, req.Dbdomain, dbdClient)
 
-	if err := task.Call(ctx); err != nil {
-		return nil, fmt.Errorf("failed to bootstrap database : %v", err)
+	resp, err := dbdClient.FileExists(ctx, &dbdpb.FileExistsRequest{Name: consts.ProvisioningDoneFile})
+	if err != nil {
+		return nil, fmt.Errorf("configagent/BootstrapDatabase: failed to check a provisioning file: %v", err)
 	}
+
+	if resp.Exists {
+		klog.InfoS("configagent/BootstrapDatabase: provisioning file found, skip bootstrapping")
+		return &lropb.Operation{Done: true}, nil
+	}
+
+	switch req.GetMode() {
+	case pb.BootstrapDatabaseRequest_ProvisionUnseeded:
+		task := provision.NewBootstrapDatabaseTaskForUnseeded(req.CdbName, req.DbUniqueName, req.Dbdomain, dbdClient)
+
+		if err := task.Call(ctx); err != nil {
+			return nil, fmt.Errorf("configagent/BootstrapDatabase: failed to bootstrap database : %v", err)
+		}
+	case pb.BootstrapDatabaseRequest_ProvisionSeeded:
+		if _, err = dbdClient.BootstrapDatabase(ctx, &dbdpb.BootstrapDatabaseRequest{
+			CdbName:  req.GetCdbName(),
+			DbDomain: req.GetDbdomain(),
+		}); err != nil {
+			return nil, fmt.Errorf("configagent/BootstrapDatabase: error while call dbdaemon/BootstrapDatabase: %v", err)
+		}
+		return &lropb.Operation{Done: true}, nil
+	default:
+	}
+
+	if _, err = dbdClient.CreateListener(ctx, &dbdpb.CreateListenerRequest{
+		DatabaseName: req.GetCdbName(),
+		Port:         consts.SecureListenerPort,
+		Protocol:     "TCP",
+		DbDomain:     req.GetDbdomain(),
+	}); err != nil {
+		return nil, fmt.Errorf("configagent/BootstrapDatabase: error while creating listener: %v", err)
+	}
+
+	if _, err = dbdClient.CreateFile(ctx, &dbdpb.CreateFileRequest{
+		Path: consts.ProvisioningDoneFile,
+	}); err != nil {
+		return nil, fmt.Errorf("configagent/BootstrapDatabase: error while creating provisioning done file: %v", err)
+	}
+
 	return &lropb.Operation{Done: true}, nil
 }
 

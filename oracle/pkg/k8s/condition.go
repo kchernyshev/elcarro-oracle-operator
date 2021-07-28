@@ -33,6 +33,7 @@ const (
 	// Condition Reasons
 	// Backup schedule concurrent policy is relying on the backup ready condition’s reason,
 	// BackupReady and BackupFailed means backup job is not running and scheduler will continue creating backup.
+	BackupPending                  = "BackupPending"
 	BackupReady                    = "BackupReady"
 	BackupInProgress               = "BackupInProgress"
 	BackupFailed                   = "BackupFailed"
@@ -40,13 +41,17 @@ const (
 	CreateFailed                   = "CreateFailed"
 	CreateInProgress               = "CreateInProgress"
 	CreatePending                  = "CreatePending"
+	AwaitingRestore                = "AwaitingRestore"
 	ImportComplete                 = "ImportComplete"
 	ImportFailed                   = "ImportFailed"
 	ImportInProgress               = "ImportInProgress"
 	ImportPending                  = "ImportPending"
 	RestoreComplete                = "RestoreComplete"
 	RestoreFailed                  = "RestoreFailed"
+	RestorePreparationInProgress   = "RestorePreparationInProgress"
+	RestorePreparationComplete     = "RestorePreparationComplete"
 	RestoreInProgress              = "RestoreInProgress"
+	PostRestoreBootstrapInProgress = "PostRestoreBootstrapInProgress"
 	SyncInProgress                 = "SyncInProgress"
 	UserOutOfSync                  = "UserOutOfSync"
 	SyncComplete                   = "SyncComplete"
@@ -62,6 +67,8 @@ const (
 
 	ParameterUpdateInProgress = "ParameterUpdateInProgress"
 	ParameterUpdateRollback   = "ParameterUpdateRollback"
+
+	NotSupported = "NotSupported"
 )
 
 var (

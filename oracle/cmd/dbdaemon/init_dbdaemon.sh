@@ -14,19 +14,13 @@
 # limitations under the License.
 
 
-set -e
+SCRIPTS_DIR="/agents"
 
-# check all go
-gofmt -w ./
-
-# tidy up go.mod
-go mod tidy
-
-# check all protos (on workstations, prow (debian) is too old to format the same way)
-if clang-format --version | grep google3-trunk; then
-  proto_files="$(find ./ -name '*.proto')"
-  for proto in ${proto_files[@]}; do
-    clang-format --style=google -i "$proto"
-  done
+echo "$(date +%Y-%m-%d.%H:%M:%S) Enabling Unified Auditing in the dbdaemon container..."  >> "${SCRIPTS_DIR}/init_dbdaemon.log"
+make -C $ORACLE_HOME/rdbms/lib -f ins_rdbms.mk uniaud_on ioracle ORACLE_HOME="${ORACLE_HOME}" >> "${SCRIPTS_DIR}/init_dbdaemon.log"
+rc=$?
+if (( ${rc} != 0 )); then
+  echo "$(date +%Y-%m-%d.%H:%M:%S) Error occurred while attempting to enable Unified Auditing in the dbdaemon container: ${rc}"  >> "${SCRIPTS_DIR}/init_dbdaemon.log"
 fi
 
+${SCRIPTS_DIR}/dbdaemon --cdb_name="$1"
