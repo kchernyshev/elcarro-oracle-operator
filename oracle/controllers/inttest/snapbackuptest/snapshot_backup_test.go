@@ -49,7 +49,7 @@ var _ = Describe("Backup through snapshot", func() {
 		defer GinkgoRecover()
 		namespace = testhelpers.RandName("backup-snap-crd-test")
 		instanceName = "mydb"
-		k8sEnv.Init(namespace)
+		k8sEnv.Init(namespace, namespace)
 	})
 
 	AfterEach(func() {
@@ -130,7 +130,7 @@ var _ = Describe("Backup through snapshot", func() {
 				RequestTime:      metav1.Time{Time: time.Now()},
 			}
 
-			testhelpers.K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
+			testhelpers.K8sUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
 				instKey,
 				createdInstance,
 				func(obj *client.Object) {
@@ -149,10 +149,6 @@ var _ = Describe("Backup through snapshot", func() {
 			testhelpers.VerifySimpleData(k8sEnv)
 		})
 	}
-
-	Context("Oracle 12.2 EE", func() {
-		snapBackupTest("12.2", "EE")
-	})
 
 	Context("Oracle 19.3 EE", func() {
 		snapBackupTest("19.3", "EE")

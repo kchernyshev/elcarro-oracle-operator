@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +59,7 @@ func (f *fakeBackupReconiler) Reconcile(_ context.Context, req reconcile.Request
 		return ctrl.Result{}, nil
 	}
 	backup.Status.Conditions = k8s.Upsert(backup.Status.Conditions, k8s.Ready, v1.ConditionTrue, k8s.BackupReady, "")
+	backup.Status.Phase = commonv1alpha1.BackupSucceeded
 	if err := f.Status().Update(ctx, &backup); err != nil {
 		return reconcile.Result{}, err
 	}
@@ -70,15 +72,26 @@ func (f *fakeBackupReconiler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func TestBackupsScheduleController(t *testing.T) {
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "BackupSchedule controller", func() []testhelpers.Reconciler {
-		backupReconciler := &fakeBackupReconiler{k8sClient}
-		backupScheduleReconciler := backupschedulecontroller.NewBackupScheduleReconciler(k8sManager)
-		cronanythingReconciler, err := cronanythingcontroller.NewCronAnythingReconciler(k8sManager, ctrl.Log.WithName("controllers").WithName("CronAnything"))
-		if err != nil {
-			t.Fatalf("failed to create cronanythingcontroller for backup schedule test")
-		}
-		return []testhelpers.Reconciler{backupReconciler, backupScheduleReconciler, cronanythingReconciler}
-	})
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"BackupSchedule controller",
+		func() []testhelpers.Reconciler {
+			backupReconciler := &fakeBackupReconiler{k8sClient}
+			backupScheduleReconciler := backupschedulecontroller.NewBackupScheduleReconciler(
+				k8sManager,
+				&backupschedulecontroller.RealBackupScheduleControl{Client: k8sManager.GetClient()},
+				&cronanythingcontroller.RealCronAnythingControl{Client: k8sManager.GetClient()},
+				&backupschedulecontroller.RealBackupControl{Client: k8sManager.GetClient()},
+			)
+			cronanythingReconciler, err := cronanythingcontroller.NewCronAnythingReconciler(k8sManager, ctrl.Log.WithName("controllers").WithName("CronAnything"), &cronanythingcontroller.RealCronAnythingControl{
+				Client: k8sManager.GetClient(),
+			})
+			if err != nil {
+				t.Fatalf("failed to create cronanythingcontroller for backup schedule test")
+			}
+			return []testhelpers.Reconciler{backupReconciler, backupScheduleReconciler, cronanythingReconciler}
+		})
 }
 
 var _ = Describe("BackupSchedule controller", func() {
@@ -167,8 +180,10 @@ func testBackupCreation(namespace, backupScheduleName, instanceName string) {
 					Type:     commonv1alpha1.BackupTypeSnapshot,
 				},
 			},
-			Schedule:                "* * * * *",
-			StartingDeadlineSeconds: pointer.Int64Ptr(5),
+			BackupScheduleSpec: commonv1alpha1.BackupScheduleSpec{
+				Schedule:                "* * * * *",
+				StartingDeadlineSeconds: pointer.Int64Ptr(5),
+			},
 		},
 	}
 	Expect(k8sClient.Create(context.TODO(), backupSchedule)).Should(Succeed())
@@ -200,10 +215,12 @@ func testBackupRetention(namespace, backupScheduleName, instanceName string) {
 					Type:     commonv1alpha1.BackupTypeSnapshot,
 				},
 			},
-			Schedule:                "* * * * *",
-			StartingDeadlineSeconds: pointer.Int64Ptr(5),
-			BackupRetentionPolicy: &v1alpha1.BackupRetentionPolicy{
-				BackupRetention: pointer.Int32Ptr(2),
+			BackupScheduleSpec: commonv1alpha1.BackupScheduleSpec{
+				Schedule:                "* * * * *",
+				StartingDeadlineSeconds: pointer.Int64Ptr(5),
+				BackupRetentionPolicy: &commonv1alpha1.BackupRetentionPolicy{
+					BackupRetention: pointer.Int32Ptr(2),
+				},
 			},
 		},
 	}

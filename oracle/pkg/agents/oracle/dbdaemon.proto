@@ -29,9 +29,8 @@ option go_package = "github.com/GoogleCloudPlatform/elcarro-oracle-operator/orac
 // DatabaseDaemon defines the API for a daemon running together with
 // a database in the same container.
 service DatabaseDaemon {
-  // CreateDir RPC call to create a directory named path, along with any
-  // necessary parents.
-  rpc CreateDir(CreateDirRequest) returns (CreateDirResponse);
+  // CreateDirs RPC call to create directories along with any necessary parents.
+  rpc CreateDirs(CreateDirsRequest) returns (CreateDirsResponse);
 
   // ReadDir RPC call to read the directory named by path and returns Fileinfos
   // for the path and children.
@@ -78,11 +77,6 @@ service DatabaseDaemon {
   rpc CreatePasswordFile(CreatePasswordFileRequest)
       returns (CreatePasswordFileResponse);
 
-  // CreateReplicaInitOraFile creates init.ora file using the template and the
-  // provided parameters.
-  rpc CreateReplicaInitOraFile(CreateReplicaInitOraFileRequest)
-      returns (CreateReplicaInitOraFileResponse);
-
   // SetListenerRegistration sets a static listener registration and restarts
   // the listener.
   rpc SetListenerRegistration(SetListenerRegistrationRequest)
@@ -92,11 +86,12 @@ service DatabaseDaemon {
   rpc BootstrapStandby(BootstrapStandbyRequest)
       returns (BootstrapStandbyResponse);
 
-  // CreateCDB creates a database instance.
-  rpc CreateCDB(CreateCDBRequest) returns (CreateCDBResponse);
-
   // CreateCDBAsync creates a database instance asynchronously.
   rpc CreateCDBAsync(CreateCDBAsyncRequest)
+      returns (google.longrunning.Operation);
+
+  // BootstrapDatabaseAsync bootstraps seeded database asynchronously.
+  rpc BootstrapDatabaseAsync(BootstrapDatabaseAsyncRequest)
       returns (google.longrunning.Operation);
 
   // CreateListener creates a database listener.
@@ -157,17 +152,22 @@ service DatabaseDaemon {
   // BootstrapDatabase bootstraps seeded database by executing init_oracle
   rpc BootstrapDatabase(BootstrapDatabaseRequest)
       returns (BootstrapDatabaseResponse) {}
+
+  // SetDnfsState sets dNFS state
+  rpc SetDnfsState(SetDnfsStateRequest) returns (SetDnfsStateResponse) {}
 }
 
-message CreateDirRequest {
-  // path is a directory name.
-  string path = 1;
-  // perm is the permission bits perm (before umask) are used for all
-  // directories CreateDir creates.
-  uint32 perm = 2;
+message CreateDirsRequest {
+  message DirInfo {
+    // path is a directory name.
+    string path = 1;
+    // perm is the permission bits perm (before umask) are used for path
+    uint32 perm = 2;
+  }
+  repeated DirInfo dirs = 1;
 }
 
-message CreateDirResponse {}
+message CreateDirsResponse {}
 
 message ReadDirRequest {
   // path is a directory name.
@@ -252,23 +252,6 @@ message CreatePasswordFileRequest {
 }
 
 message CreatePasswordFileResponse {}
-
-message CreateReplicaInitOraFileRequest {
-  string em_host = 1;
-  int32 em_port = 2;
-  string em_db_name = 3;
-  string em_db_unique_name = 4;
-  string em_db_domain = 5;
-  string log_file_dir_list = 6;
-  string data_file_dir_list = 7;
-  string em_compatibility = 8;
-  string init_ora_dir = 9;
-  string init_ora_file_name = 10;
-}
-
-message CreateReplicaInitOraFileResponse {
-  string init_ora_file_content = 1;
-}
 
 // KnownPDBsRequest is a message used for getting
 // a list of known PDBs in a CDB.
@@ -464,6 +447,7 @@ message FetchServiceImageMetaDataResponse {
   string version = 1;
   string cdb_name = 2;
   string oracle_home = 3;
+  bool seeded_image = 4;
 }
 
 message CreateFileRequest {
@@ -475,6 +459,11 @@ message CreateFileResponse {}
 message BootstrapDatabaseRequest {
   string cdb_name = 1;
   string db_domain = 2;
+}
+
+message BootstrapDatabaseAsyncRequest {
+  BootstrapDatabaseRequest sync_request = 1;
+  LROInput lro_input = 2;
 }
 
 message BootstrapDatabaseResponse {}

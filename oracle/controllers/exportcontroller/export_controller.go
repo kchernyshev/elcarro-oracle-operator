@@ -42,6 +42,8 @@ type ExportReconciler struct {
 	Scheme        *runtime.Scheme
 	ClientFactory controllers.ConfigAgentClientFactory
 	Recorder      record.EventRecorder
+
+	DatabaseClientFactory controllers.DatabaseClientFactory
 }
 
 const (
@@ -216,7 +218,7 @@ func (r *ExportReconciler) handleRunningExport(ctx context.Context, log logr.Log
 	operationID := lroOperationID(exp)
 
 	// check export LRO status
-	operation, err := controllers.GetLROOperation(r.ClientFactory, ctx, r, req.Namespace, operationID, exp.Spec.Instance)
+	operation, err := controllers.GetLROOperation(ctx, r.DatabaseClientFactory, r.Client, operationID, exp.GetNamespace(), exp.Spec.Instance)
 	if err != nil {
 		log.Error(err, "GetLROOperation returned an error")
 		return ctrl.Result{}, err
@@ -230,7 +232,7 @@ func (r *ExportReconciler) handleRunningExport(ctx context.Context, log logr.Log
 	// handle export LRO completion
 	log.Info("LRO is DONE", "operationID", operationID)
 	defer func() {
-		_ = controllers.DeleteLROOperation(r.ClientFactory, ctx, r, req.Namespace, operationID, exp.Spec.Instance)
+		_ = controllers.DeleteLROOperation(ctx, r.DatabaseClientFactory, r.Client, operationID, exp.Namespace, exp.Spec.Instance)
 	}()
 
 	if operation.GetError() != nil {

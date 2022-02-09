@@ -25,8 +25,12 @@ set -o pipefail
 
 set -x #echo on
 
-# Delete service account for integration tests
 export SA="${PROW_INT_TEST_SA}@${PROW_PROJECT}.iam.gserviceaccount.com"
-gcloud iam service-accounts delete $SA -q
+
+# Delete GCS bucket permissions for integration tests
+gsutil iam ch -d serviceAccount:"${SA}" gs://"${PROW_PROJECT}"
+
+# Delete service account for integration tests
+gcloud iam service-accounts delete "${SA}" -q
 
 set +x #echo off

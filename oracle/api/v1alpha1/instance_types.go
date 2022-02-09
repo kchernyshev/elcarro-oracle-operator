@@ -83,10 +83,9 @@ type InstanceSpec struct {
 	// +kubebuilder:validation:Maximum=100
 	MemoryPercent int `json:"memoryPercent,omitempty"`
 
-	// DBNetworkServiceOptions allows to override some details of kubernetes
-	// Service created to expose a connection to database.
+	// EnableDnfs enables configuration of Oracle's dNFS functionality.
 	// +optional
-	DBNetworkServiceOptions *DBNetworkServiceOptions `json:"dbNetworkServiceOptions,omitempty"`
+	EnableDnfs bool `json:"enableDnfs,omitempty"`
 }
 
 type BackupReference struct {
@@ -147,24 +146,6 @@ type RestoreSpec struct {
 	RequestTime metav1.Time `json:"requestTime"`
 }
 
-// DBNetworkServiceOptions contains customization options of kubernetes Service
-// exposing a database connection.
-type DBNetworkServiceOptions struct {
-	// GCP contains Google Cloud specific attributes of Service configuration.
-	// +optional
-	GCP DBNetworkServiceOptionsGCP `json:"gcp,omitempty"`
-}
-
-// DBNetworkServiceOptionsGCP contains customization options of kubernetes
-// Service created for database connection that are specific to GCP.
-type DBNetworkServiceOptionsGCP struct {
-	// LoadBalancerType let's define a type of load balancer, see
-	// https://kubernetes.io/docs/concepts/services-networking/service/#internal-load-balancer
-	// +kubebuilder:validation:Enum="";Internal;External
-	// +optional
-	LoadBalancerType string `json:"loadBalancerType,omitempty"`
-}
-
 // InstanceStatus defines the observed state of Instance.
 type InstanceStatus struct {
 	// InstanceStatus represents the database engine agnostic
@@ -191,6 +172,16 @@ type InstanceStatus struct {
 	// LastFailedParameterUpdate is used to avoid getting into the failed
 	// parameter update loop.
 	LastFailedParameterUpdate map[string]string `json:"lastFailedParameterUpdate,omitempty"`
+
+	// LockedByController is a shared lock field granting exclusive access
+	// to maintenance operations to only one controller.
+	// Empty value means unlocked.
+	// Non-empty value contains the name of the owning controller.
+	// +optional
+	LockedByController string `json:"lockedBy,omitempty"`
+
+	// DnfsEnabled stores whether dNFS has already been enabled or not.
+	DnfsEnabled bool `json:"DnfsEnabled,omitempty"`
 }
 
 // +kubebuilder:object:root=true

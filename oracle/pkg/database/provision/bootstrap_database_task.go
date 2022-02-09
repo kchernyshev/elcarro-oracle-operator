@@ -219,6 +219,24 @@ func (task *BootstrapTask) setupUsers(ctx context.Context) error {
 	return nil
 }
 
+// createDumpDirs creates the required adump and cdump dirs..
+func (task *BootstrapTask) createDumpDirs(ctx context.Context) error {
+	dumpDirs := []string{"adump", "cdump"}
+	var toCreate []*dbdpb.CreateDirsRequest_DirInfo
+	for _, dumpDir := range dumpDirs {
+		toCreate = append(toCreate, &dbdpb.CreateDirsRequest_DirInfo{
+			Path: fmt.Sprintf("%s/admin/%s/%s", consts.OracleBase, task.db.GetDatabaseName(), dumpDir),
+			Perm: 760,
+		})
+	}
+	if _, err := task.dbdClient.CreateDirs(ctx, &dbdpb.CreateDirsRequest{
+		Dirs: toCreate,
+	}); err != nil {
+		return fmt.Errorf("configagent/createDumpDirs: error while creating the dump dirs: %v", err)
+	}
+	return nil
+}
+
 func (task *BootstrapTask) moveConfigFiles(ctx context.Context) error {
 	for i := range task.db.GetConfigFiles() {
 		sf := filepath.Join(task.db.GetSourceConfigFilesDir(), task.db.GetSourceConfigFiles()[i])
@@ -780,6 +798,7 @@ func NewBootstrapDatabaseTaskForUnseeded(cdbName, dbUniqueName, dbDomain string,
 		&simpleTask{name: "prepDatabase", callFun: bootstrapTask.prepDatabase},
 		&simpleTask{name: "setupUsers", callFun: bootstrapTask.setupUsers},
 		&simpleTask{name: "createPDBSeedTemp", callFun: bootstrapTask.createPDBSeedTemp},
+		&simpleTask{name: "createDumpDirs", callFun: bootstrapTask.createDumpDirs},
 	}
 	return bootstrapTask
 }

@@ -20,9 +20,8 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type DatabaseDaemonClient interface {
-	// CreateDir RPC call to create a directory named path, along with any
-	// necessary parents.
-	CreateDir(ctx context.Context, in *CreateDirRequest, opts ...grpc.CallOption) (*CreateDirResponse, error)
+	// CreateDirs RPC call to create directories along with any necessary parents.
+	CreateDirs(ctx context.Context, in *CreateDirsRequest, opts ...grpc.CallOption) (*CreateDirsResponse, error)
 	// ReadDir RPC call to read the directory named by path and returns Fileinfos
 	// for the path and children.
 	ReadDir(ctx context.Context, in *ReadDirRequest, opts ...grpc.CallOption) (*ReadDirResponse, error)
@@ -52,18 +51,15 @@ type DatabaseDaemonClient interface {
 	GetDatabaseName(ctx context.Context, in *GetDatabaseNameRequest, opts ...grpc.CallOption) (*GetDatabaseNameResponse, error)
 	// CreatePasswordFile creates a password file for the database.
 	CreatePasswordFile(ctx context.Context, in *CreatePasswordFileRequest, opts ...grpc.CallOption) (*CreatePasswordFileResponse, error)
-	// CreateReplicaInitOraFile creates init.ora file using the template and the
-	// provided parameters.
-	CreateReplicaInitOraFile(ctx context.Context, in *CreateReplicaInitOraFileRequest, opts ...grpc.CallOption) (*CreateReplicaInitOraFileResponse, error)
 	// SetListenerRegistration sets a static listener registration and restarts
 	// the listener.
 	SetListenerRegistration(ctx context.Context, in *SetListenerRegistrationRequest, opts ...grpc.CallOption) (*BounceListenerResponse, error)
 	// BootstrapStandby performs bootstrap tasks that have to be done by dbdaemon.
 	BootstrapStandby(ctx context.Context, in *BootstrapStandbyRequest, opts ...grpc.CallOption) (*BootstrapStandbyResponse, error)
-	// CreateCDB creates a database instance.
-	CreateCDB(ctx context.Context, in *CreateCDBRequest, opts ...grpc.CallOption) (*CreateCDBResponse, error)
 	// CreateCDBAsync creates a database instance asynchronously.
 	CreateCDBAsync(ctx context.Context, in *CreateCDBAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
+	// BootstrapDatabaseAsync bootstraps seeded database asynchronously.
+	BootstrapDatabaseAsync(ctx context.Context, in *BootstrapDatabaseAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	// CreateListener creates a database listener.
 	CreateListener(ctx context.Context, in *CreateListenerRequest, opts ...grpc.CallOption) (*CreateListenerResponse, error)
 	// FileExists runs a simple check to confirm whether a requested file
@@ -100,6 +96,8 @@ type DatabaseDaemonClient interface {
 	CreateFile(ctx context.Context, in *CreateFileRequest, opts ...grpc.CallOption) (*CreateFileResponse, error)
 	// BootstrapDatabase bootstraps seeded database by executing init_oracle
 	BootstrapDatabase(ctx context.Context, in *BootstrapDatabaseRequest, opts ...grpc.CallOption) (*BootstrapDatabaseResponse, error)
+	// SetDnfsState sets dNFS state
+	SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error)
 }
 
 type databaseDaemonClient struct {
@@ -110,9 +108,9 @@ func NewDatabaseDaemonClient(cc grpc.ClientConnInterface) DatabaseDaemonClient {
 	return &databaseDaemonClient{cc}
 }
 
-func (c *databaseDaemonClient) CreateDir(ctx context.Context, in *CreateDirRequest, opts ...grpc.CallOption) (*CreateDirResponse, error) {
-	out := new(CreateDirResponse)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateDir", in, out, opts...)
+func (c *databaseDaemonClient) CreateDirs(ctx context.Context, in *CreateDirsRequest, opts ...grpc.CallOption) (*CreateDirsResponse, error) {
+	out := new(CreateDirsResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateDirs", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -245,15 +243,6 @@ func (c *databaseDaemonClient) CreatePasswordFile(ctx context.Context, in *Creat
 	return out, nil
 }
 
-func (c *databaseDaemonClient) CreateReplicaInitOraFile(ctx context.Context, in *CreateReplicaInitOraFileRequest, opts ...grpc.CallOption) (*CreateReplicaInitOraFileResponse, error) {
-	out := new(CreateReplicaInitOraFileResponse)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateReplicaInitOraFile", in, out, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *databaseDaemonClient) SetListenerRegistration(ctx context.Context, in *SetListenerRegistrationRequest, opts ...grpc.CallOption) (*BounceListenerResponse, error) {
 	out := new(BounceListenerResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/SetListenerRegistration", in, out, opts...)
@@ -272,18 +261,18 @@ func (c *databaseDaemonClient) BootstrapStandby(ctx context.Context, in *Bootstr
 	return out, nil
 }
 
-func (c *databaseDaemonClient) CreateCDB(ctx context.Context, in *CreateCDBRequest, opts ...grpc.CallOption) (*CreateCDBResponse, error) {
-	out := new(CreateCDBResponse)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateCDB", in, out, opts...)
+func (c *databaseDaemonClient) CreateCDBAsync(ctx context.Context, in *CreateCDBAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error) {
+	out := new(longrunning.Operation)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateCDBAsync", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *databaseDaemonClient) CreateCDBAsync(ctx context.Context, in *CreateCDBAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error) {
+func (c *databaseDaemonClient) BootstrapDatabaseAsync(ctx context.Context, in *BootstrapDatabaseAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error) {
 	out := new(longrunning.Operation)
-	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/CreateCDBAsync", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/BootstrapDatabaseAsync", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -407,13 +396,21 @@ func (c *databaseDaemonClient) BootstrapDatabase(ctx context.Context, in *Bootst
 	return out, nil
 }
 
+func (c *databaseDaemonClient) SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error) {
+	out := new(SetDnfsStateResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/SetDnfsState", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DatabaseDaemonServer is the server API for DatabaseDaemon service.
 // All implementations must embed UnimplementedDatabaseDaemonServer
 // for forward compatibility
 type DatabaseDaemonServer interface {
-	// CreateDir RPC call to create a directory named path, along with any
-	// necessary parents.
-	CreateDir(context.Context, *CreateDirRequest) (*CreateDirResponse, error)
+	// CreateDirs RPC call to create directories along with any necessary parents.
+	CreateDirs(context.Context, *CreateDirsRequest) (*CreateDirsResponse, error)
 	// ReadDir RPC call to read the directory named by path and returns Fileinfos
 	// for the path and children.
 	ReadDir(context.Context, *ReadDirRequest) (*ReadDirResponse, error)
@@ -443,18 +440,15 @@ type DatabaseDaemonServer interface {
 	GetDatabaseName(context.Context, *GetDatabaseNameRequest) (*GetDatabaseNameResponse, error)
 	// CreatePasswordFile creates a password file for the database.
 	CreatePasswordFile(context.Context, *CreatePasswordFileRequest) (*CreatePasswordFileResponse, error)
-	// CreateReplicaInitOraFile creates init.ora file using the template and the
-	// provided parameters.
-	CreateReplicaInitOraFile(context.Context, *CreateReplicaInitOraFileRequest) (*CreateReplicaInitOraFileResponse, error)
 	// SetListenerRegistration sets a static listener registration and restarts
 	// the listener.
 	SetListenerRegistration(context.Context, *SetListenerRegistrationRequest) (*BounceListenerResponse, error)
 	// BootstrapStandby performs bootstrap tasks that have to be done by dbdaemon.
 	BootstrapStandby(context.Context, *BootstrapStandbyRequest) (*BootstrapStandbyResponse, error)
-	// CreateCDB creates a database instance.
-	CreateCDB(context.Context, *CreateCDBRequest) (*CreateCDBResponse, error)
 	// CreateCDBAsync creates a database instance asynchronously.
 	CreateCDBAsync(context.Context, *CreateCDBAsyncRequest) (*longrunning.Operation, error)
+	// BootstrapDatabaseAsync bootstraps seeded database asynchronously.
+	BootstrapDatabaseAsync(context.Context, *BootstrapDatabaseAsyncRequest) (*longrunning.Operation, error)
 	// CreateListener creates a database listener.
 	CreateListener(context.Context, *CreateListenerRequest) (*CreateListenerResponse, error)
 	// FileExists runs a simple check to confirm whether a requested file
@@ -491,6 +485,8 @@ type DatabaseDaemonServer interface {
 	CreateFile(context.Context, *CreateFileRequest) (*CreateFileResponse, error)
 	// BootstrapDatabase bootstraps seeded database by executing init_oracle
 	BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error)
+	// SetDnfsState sets dNFS state
+	SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error)
 	mustEmbedUnimplementedDatabaseDaemonServer()
 }
 
@@ -498,8 +494,8 @@ type DatabaseDaemonServer interface {
 type UnimplementedDatabaseDaemonServer struct {
 }
 
-func (UnimplementedDatabaseDaemonServer) CreateDir(context.Context, *CreateDirRequest) (*CreateDirResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateDir not implemented")
+func (UnimplementedDatabaseDaemonServer) CreateDirs(context.Context, *CreateDirsRequest) (*CreateDirsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateDirs not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) ReadDir(context.Context, *ReadDirRequest) (*ReadDirResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ReadDir not implemented")
@@ -543,20 +539,17 @@ func (UnimplementedDatabaseDaemonServer) GetDatabaseName(context.Context, *GetDa
 func (UnimplementedDatabaseDaemonServer) CreatePasswordFile(context.Context, *CreatePasswordFileRequest) (*CreatePasswordFileResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreatePasswordFile not implemented")
 }
-func (UnimplementedDatabaseDaemonServer) CreateReplicaInitOraFile(context.Context, *CreateReplicaInitOraFileRequest) (*CreateReplicaInitOraFileResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateReplicaInitOraFile not implemented")
-}
 func (UnimplementedDatabaseDaemonServer) SetListenerRegistration(context.Context, *SetListenerRegistrationRequest) (*BounceListenerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method SetListenerRegistration not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) BootstrapStandby(context.Context, *BootstrapStandbyRequest) (*BootstrapStandbyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BootstrapStandby not implemented")
 }
-func (UnimplementedDatabaseDaemonServer) CreateCDB(context.Context, *CreateCDBRequest) (*CreateCDBResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateCDB not implemented")
-}
 func (UnimplementedDatabaseDaemonServer) CreateCDBAsync(context.Context, *CreateCDBAsyncRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateCDBAsync not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) BootstrapDatabaseAsync(context.Context, *BootstrapDatabaseAsyncRequest) (*longrunning.Operation, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method BootstrapDatabaseAsync not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) CreateListener(context.Context, *CreateListenerRequest) (*CreateListenerResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateListener not implemented")
@@ -597,6 +590,9 @@ func (UnimplementedDatabaseDaemonServer) CreateFile(context.Context, *CreateFile
 func (UnimplementedDatabaseDaemonServer) BootstrapDatabase(context.Context, *BootstrapDatabaseRequest) (*BootstrapDatabaseResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BootstrapDatabase not implemented")
 }
+func (UnimplementedDatabaseDaemonServer) SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetDnfsState not implemented")
+}
 func (UnimplementedDatabaseDaemonServer) mustEmbedUnimplementedDatabaseDaemonServer() {}
 
 // UnsafeDatabaseDaemonServer may be embedded to opt out of forward compatibility for this service.
@@ -610,20 +606,20 @@ func RegisterDatabaseDaemonServer(s grpc.ServiceRegistrar, srv DatabaseDaemonSer
 	s.RegisterService(&DatabaseDaemon_ServiceDesc, srv)
 }
 
-func _DatabaseDaemon_CreateDir_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateDirRequest)
+func _DatabaseDaemon_CreateDirs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateDirsRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(DatabaseDaemonServer).CreateDir(ctx, in)
+		return srv.(DatabaseDaemonServer).CreateDirs(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/agents.oracle.DatabaseDaemon/CreateDir",
+		FullMethod: "/agents.oracle.DatabaseDaemon/CreateDirs",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DatabaseDaemonServer).CreateDir(ctx, req.(*CreateDirRequest))
+		return srv.(DatabaseDaemonServer).CreateDirs(ctx, req.(*CreateDirsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -880,24 +876,6 @@ func _DatabaseDaemon_CreatePasswordFile_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DatabaseDaemon_CreateReplicaInitOraFile_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateReplicaInitOraFileRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(DatabaseDaemonServer).CreateReplicaInitOraFile(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/agents.oracle.DatabaseDaemon/CreateReplicaInitOraFile",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DatabaseDaemonServer).CreateReplicaInitOraFile(ctx, req.(*CreateReplicaInitOraFileRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _DatabaseDaemon_SetListenerRegistration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SetListenerRegistrationRequest)
 	if err := dec(in); err != nil {
@@ -934,24 +912,6 @@ func _DatabaseDaemon_BootstrapStandby_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _DatabaseDaemon_CreateCDB_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateCDBRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(DatabaseDaemonServer).CreateCDB(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/agents.oracle.DatabaseDaemon/CreateCDB",
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(DatabaseDaemonServer).CreateCDB(ctx, req.(*CreateCDBRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _DatabaseDaemon_CreateCDBAsync_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateCDBAsyncRequest)
 	if err := dec(in); err != nil {
@@ -966,6 +926,24 @@ func _DatabaseDaemon_CreateCDBAsync_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DatabaseDaemonServer).CreateCDBAsync(ctx, req.(*CreateCDBAsyncRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DatabaseDaemon_BootstrapDatabaseAsync_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BootstrapDatabaseAsyncRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).BootstrapDatabaseAsync(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/BootstrapDatabaseAsync",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).BootstrapDatabaseAsync(ctx, req.(*BootstrapDatabaseAsyncRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1204,6 +1182,24 @@ func _DatabaseDaemon_BootstrapDatabase_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_SetDnfsState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetDnfsStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).SetDnfsState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/SetDnfsState",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).SetDnfsState(ctx, req.(*SetDnfsStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DatabaseDaemon_ServiceDesc is the grpc.ServiceDesc for DatabaseDaemon service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1212,8 +1208,8 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*DatabaseDaemonServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "CreateDir",
-			Handler:    _DatabaseDaemon_CreateDir_Handler,
+			MethodName: "CreateDirs",
+			Handler:    _DatabaseDaemon_CreateDirs_Handler,
 		},
 		{
 			MethodName: "ReadDir",
@@ -1272,10 +1268,6 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DatabaseDaemon_CreatePasswordFile_Handler,
 		},
 		{
-			MethodName: "CreateReplicaInitOraFile",
-			Handler:    _DatabaseDaemon_CreateReplicaInitOraFile_Handler,
-		},
-		{
 			MethodName: "SetListenerRegistration",
 			Handler:    _DatabaseDaemon_SetListenerRegistration_Handler,
 		},
@@ -1284,12 +1276,12 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DatabaseDaemon_BootstrapStandby_Handler,
 		},
 		{
-			MethodName: "CreateCDB",
-			Handler:    _DatabaseDaemon_CreateCDB_Handler,
-		},
-		{
 			MethodName: "CreateCDBAsync",
 			Handler:    _DatabaseDaemon_CreateCDBAsync_Handler,
+		},
+		{
+			MethodName: "BootstrapDatabaseAsync",
+			Handler:    _DatabaseDaemon_BootstrapDatabaseAsync_Handler,
 		},
 		{
 			MethodName: "CreateListener",
@@ -1342,6 +1334,10 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BootstrapDatabase",
 			Handler:    _DatabaseDaemon_BootstrapDatabase_Handler,
+		},
+		{
+			MethodName: "SetDnfsState",
+			Handler:    _DatabaseDaemon_SetDnfsState_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

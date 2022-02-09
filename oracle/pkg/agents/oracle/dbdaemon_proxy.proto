@@ -39,6 +39,11 @@ service DatabaseDaemonProxy {
   // ProxyRunInitOracle RPC call exec init_oracle binary with specified params
   rpc ProxyRunInitOracle(ProxyRunInitOracleRequest)
       returns (ProxyRunInitOracleResponse) {}
+  // ProxyFetchServiceImageMetaData returns metadata from the oracledb container
+  rpc ProxyFetchServiceImageMetaData(ProxyFetchServiceImageMetaDataRequest)
+      returns (ProxyFetchServiceImageMetaDataResponse) {}
+  // SetDnfsState set dNFS state
+  rpc SetDnfsState(SetDnfsStateRequest) returns (SetDnfsStateResponse) {}
 }
 
 message SetEnvRequest {
@@ -70,3 +75,11 @@ message ProxyRunInitOracleRequest {
 }
 
 message ProxyRunInitOracleResponse {}
+
+message ProxyFetchServiceImageMetaDataRequest {}
+message ProxyFetchServiceImageMetaDataResponse {
+  string version = 1;
+  string cdb_name = 2;
+  string oracle_home = 3;
+  bool seeded_image = 4;
+}

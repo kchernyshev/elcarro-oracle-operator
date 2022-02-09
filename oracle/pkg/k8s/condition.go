@@ -15,6 +15,7 @@
 package k8s
 
 import (
+	"strings"
 	"time"
 
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +42,9 @@ const (
 	CreateFailed                   = "CreateFailed"
 	CreateInProgress               = "CreateInProgress"
 	CreatePending                  = "CreatePending"
-	AwaitingRestore                = "AwaitingRestore"
+	BootstrapPending               = "BootstrapPending"
+	BootstrapInProgress            = "BootstrapInProgress"
+	RestorePending                 = "RestorePending"
 	ImportComplete                 = "ImportComplete"
 	ImportFailed                   = "ImportFailed"
 	ImportInProgress               = "ImportInProgress"
@@ -90,6 +93,15 @@ func FindCondition(conditions []v1.Condition, name string) *v1.Condition {
 	return nil
 }
 
+func FindConditionOrFailed(conditions []v1.Condition, name string) (bool, *v1.Condition) {
+	for i, c := range conditions {
+		if c.Type == name {
+			return strings.Contains(c.Reason, "Failed"), &conditions[i]
+		}
+	}
+	return false, nil
+}
+
 func ConditionStatusEquals(cond *v1.Condition, status v1.ConditionStatus) bool {
 	if cond == nil {
 		return false
@@ -112,11 +124,11 @@ func InstanceUpsertCondition(iStatus *v1alpha1.InstanceStatus, name string, stat
 func Upsert(conditions []v1.Condition, name string, status v1.ConditionStatus, reason, message string) []v1.Condition {
 
 	if cond := FindCondition(conditions, name); cond != nil {
-		if !ConditionStatusEquals(cond, status) { // LastTransitionTime refers to the time Status changes
+		if !ConditionStatusEquals(cond, status) || !ConditionReasonEquals(cond, reason) { // LastTransitionTime refers to the time Status changes
 			cond.Status = status
+			cond.Reason = reason
 			cond.LastTransitionTime = v1Now()
 		}
-		cond.Reason = reason
 		cond.Message = message
 		return conditions
 	}

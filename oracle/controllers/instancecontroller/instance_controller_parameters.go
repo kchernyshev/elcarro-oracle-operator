@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -50,11 +51,7 @@ var reservedParameters = map[string]bool{
 	"enable_pluggable_database":  true,
 	"filesystemio_options":       true,
 	"local_listener":             true,
-	"open_cursors":               true,
-	"pga_aggregate_target":       true,
-	"processes":                  true,
 	"remote_login_passwordfile":  true,
-	"sga_target":                 true,
 	"undo_tablespace":            true,
 	"log_archive_dest_1":         true,
 	"log_archive_dest_state_1":   true,
@@ -133,19 +130,42 @@ func fetchCurrentParameterState(ctx context.Context, caClient capb.ConfigAgentCl
 func (r *InstanceReconciler) setParameters(ctx context.Context, inst v1alpha1.Instance, caClient capb.ConfigAgentClient, log logr.Logger) (bool, error) {
 	log.Info("Parameters are ", "parameters:", inst.Spec.Parameters)
 	requireDatabaseRestart := false
+	var keys []string
 
 	for k, v := range inst.Spec.Parameters {
-		response, err := caClient.SetParameter(ctx, &capb.SetParameterRequest{
-			Key:   k,
-			Value: v,
-		})
+		isStatic, err := controllers.SetParameter(ctx, r.DatabaseClientFactory, r.Client, inst.Namespace, inst.Name, k, v)
 		if err != nil {
 			log.Error(err, "setParameters: error while running SetParameter query")
 			return requireDatabaseRestart, err
 		}
-		requireDatabaseRestart = requireDatabaseRestart || response.Static
+		keys = append(keys, k)
+		requireDatabaseRestart = requireDatabaseRestart || isStatic
 		log.Info("setParameters: requireDatabaseRestart", "requireDatabaseRestart", requireDatabaseRestart)
 	}
+
+	response, err := caClient.GetParameterTypeValue(ctx, &capb.GetParameterTypeValueRequest{
+		Keys: keys,
+	})
+	if err != nil {
+		log.Error(err, "setParameters: error while running GetParameterTypeValue query")
+		return false, err
+	}
+
+	paramValues := response.GetValues()
+	for i := 0; i < len(keys); i++ {
+		if inst.Spec.Parameters[keys[i]] != paramValues[i] &&
+			// For certain parameter types Oracle converts them to uppercase before storing
+			// For eg boolean (true/false) units(char/byte)
+			strings.ToUpper(inst.Spec.Parameters[keys[i]]) != paramValues[i] {
+			msg := fmt.Sprintf("setParameters: parameter update for %s with value %s was rejected by database and instead set to %s", keys[i], inst.Spec.Parameters[keys[i]], paramValues[i])
+			log.Error(err, msg)
+			//Oracle does unit conversion while storing certain memory parameters like sga_target, pga_aggregate_target.
+			//Thereby there is no foolproof to confirm if the parameter update silently failed. Thereby we just log the
+			//parameters (whose values don't match the exact user provided values) instead of throwing an error.
+			//return false, errors.New(msg)
+		}
+	}
+
 	log.Info("setParameters: SQL commands executed successfully")
 	return requireDatabaseRestart, nil
 }
@@ -199,7 +219,7 @@ func (r *InstanceReconciler) setInstanceParameterStateMachine(ctx context.Contex
 			}
 			if restartRequired {
 				log.Info("setInstanceParameterStateMachine: static parameter specified in config, scheduling restart to activate them")
-				if _, err := caClient.BounceDatabase(ctx, &capb.BounceDatabaseRequest{
+				if err := controllers.BounceDatabase(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, controllers.BounceDatabaseRequest{
 					Sid: inst.Spec.CDBName,
 				}); err != nil {
 					msg := "setInstanceParameterStateMachine: error while restarting database after setting static parameters"
@@ -251,15 +271,13 @@ func (r *InstanceReconciler) getConfigAgentClient(ctx context.Context, req ctrl.
 func (r *InstanceReconciler) initiateRecovery(ctx context.Context, inst v1alpha1.Instance, caClient capb.ConfigAgentClient, dynamicParams map[string]string, log logr.Logger) error {
 
 	log.Info("initiateRecovery: initiating recovery of config file")
-	if _, err := caClient.RecoverConfigFile(ctx, &capb.RecoverConfigFileRequest{
-		CdbName: inst.Spec.CDBName,
-	}); err != nil {
+	if err := controllers.RecoverConfigFile(ctx, r.DatabaseClientFactory, r.Client, inst.Namespace, inst.Name, inst.Spec.CDBName); err != nil {
 		msg := "initiateRecovery: error while recovering config file"
 		log.Info(msg, "err", err)
 		return err
 	}
 
-	if _, err := caClient.BounceDatabase(ctx, &capb.BounceDatabaseRequest{
+	if err := controllers.BounceDatabase(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, controllers.BounceDatabaseRequest{
 		Sid: inst.Spec.CDBName,
 	}); err != nil {
 		return err
@@ -268,10 +286,7 @@ func (r *InstanceReconciler) initiateRecovery(ctx context.Context, inst v1alpha1
 
 	// Rollback all the dynamic parameter updates after the database has recovered
 	for k, v := range dynamicParams {
-		_, err := caClient.SetParameter(ctx, &capb.SetParameterRequest{
-			Key:   k,
-			Value: v,
-		})
+		_, err := controllers.SetParameter(ctx, r.DatabaseClientFactory, r.Client, inst.Namespace, inst.Name, k, v)
 		if err != nil {
 			log.Error(err, "initiateRecovery: error while rolling back dynamic parameters")
 			return err

@@ -99,7 +99,7 @@ type Server struct {
 	dbdClientClose func() error
 	lroServer      *lro.Server
 	syncJobs       *syncJobs
-	gcsUtil        gcsUtil
+	gcsUtil        GCSUtil
 }
 
 // Remove pdbConnStr from String(), as that may contain the pdb user/password
@@ -330,12 +330,6 @@ func (s *Server) CreatePasswordFile(ctx context.Context, req *dbdpb.CreatePasswo
 	return &dbdpb.CreatePasswordFileResponse{}, nil
 }
 
-// CreateReplicaInitOraFile creates init.ora file using the template and the provided parameters.
-func (s *Server) CreateReplicaInitOraFile(ctx context.Context, req *dbdpb.CreateReplicaInitOraFileRequest) (*dbdpb.CreateReplicaInitOraFileResponse, error) {
-	klog.InfoS("dbdaemon/CreateReplicaInitOraFile: not implemented in current release", "req", req)
-	return &dbdpb.CreateReplicaInitOraFileResponse{InitOraFileContent: ""}, nil
-}
-
 // SetListenerRegistration is a Database Daemon method to create a static listener registration.
 func (s *Server) SetListenerRegistration(ctx context.Context, req *dbdpb.SetListenerRegistrationRequest) (*dbdpb.BounceListenerResponse, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -416,7 +410,7 @@ func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRe
 	dumpDir := filepath.Join(pdbPath, consts.DpdumpDir.Linux)
 	klog.InfoS("dbdaemon/dataPumpImport", "dumpDir", dumpDir)
 
-	dmpReader, err := s.gcsUtil.download(ctx, req.GcsPath)
+	dmpReader, err := s.gcsUtil.Download(ctx, req.GcsPath)
 	if err != nil {
 		return nil, fmt.Errorf("dbdaemon/dataPumpImport: initiating GCS download failed: %v", err)
 	}
@@ -459,7 +453,7 @@ func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRe
 	if len(req.GcsLogPath) > 0 {
 		logFullPath := filepath.Join(dumpDir, logFilename)
 
-		if err := s.gcsUtil.uploadFile(ctx, req.GcsLogPath, logFullPath, contentTypePlainText); err != nil {
+		if err := s.gcsUtil.UploadFile(ctx, req.GcsLogPath, logFullPath, contentTypePlainText); err != nil {
 			return nil, fmt.Errorf("dbdaemon/dataPumpImport: import completed successfully, failed to upload import log to GCS: %v", err)
 		}
 
@@ -544,7 +538,7 @@ func (s *Server) dataPumpExport(ctx context.Context, req *dbdpb.DataPumpExportRe
 	}
 	klog.Infof("dbdaemon/dataPumpExport: export to %s completed successfully", dmpPath)
 
-	if err := s.gcsUtil.uploadFile(ctx, req.GcsPath, dmpPath, contentTypePlainText); err != nil {
+	if err := s.gcsUtil.UploadFile(ctx, req.GcsPath, dmpPath, contentTypePlainText); err != nil {
 		return nil, fmt.Errorf("dbdaemon/dataPumpExport: failed to upload dmp file to %s: %v", req.GcsPath, err)
 	}
 	klog.Infof("dbdaemon/dataPumpExport: uploaded dmp file to %s", req.GcsPath)
@@ -552,7 +546,7 @@ func (s *Server) dataPumpExport(ctx context.Context, req *dbdpb.DataPumpExportRe
 	if len(req.GcsLogPath) > 0 {
 		logPath := filepath.Join(pdbPath, consts.DpdumpDir.Linux, dmpLogFile)
 
-		if err := s.gcsUtil.uploadFile(ctx, req.GcsLogPath, logPath, contentTypePlainText); err != nil {
+		if err := s.gcsUtil.UploadFile(ctx, req.GcsLogPath, logPath, contentTypePlainText); err != nil {
 			return nil, fmt.Errorf("dbdaemon/dataPumpExport: failed to upload log file to %s: %v", req.GcsLogPath, err)
 		}
 		klog.Infof("dbdaemon/dataPumpExport: uploaded log file to %s", req.GcsLogPath)
@@ -1076,13 +1070,13 @@ func (s *Server) uploadDirectoryContentsToGCS(ctx context.Context, backupDir, gc
 		gcsTarget.Path = path.Join(gcsTarget.Path, relPath)
 		klog.InfoS("gcs", "target", gcsTarget)
 		start := time.Now()
-		err = s.gcsUtil.uploadFile(ctx, gcsTarget.String(), fpath, contentTypePlainText)
+		err = s.gcsUtil.UploadFile(ctx, gcsTarget.String(), fpath, contentTypePlainText)
 		if err != nil {
 			return err
 		}
 		end := time.Now()
 		rate := float64(info.Size()) / (end.Sub(start).Seconds())
-		klog.Infof("Uploaded %s (%f MB/s)\n", gcsTarget.String(), rate/1024/1024)
+		klog.InfoS("dbdaemon/uploadDirectoryContentsToGCS", "uploaded", gcsTarget.String(), "throughput", fmt.Sprintf("%f MB/s", rate/1024/1024))
 
 		return nil
 	})
@@ -1254,8 +1248,8 @@ func (s *Server) BootstrapStandby(ctx context.Context, req *dbdpb.BootstrapStand
 	return &dbdpb.BootstrapStandbyResponse{}, nil
 }
 
-// CreateCDB creates a database instance
-func (s *Server) CreateCDB(ctx context.Context, req *dbdpb.CreateCDBRequest) (*dbdpb.CreateCDBResponse, error) {
+// createCDB creates a database instance
+func (s *Server) createCDB(ctx context.Context, req *dbdpb.CreateCDBRequest) (*dbdpb.CreateCDBResponse, error) {
 	klog.InfoS("CreateCDB request invoked", "req", req)
 
 	password, err := security.RandOraclePassword()
@@ -1327,8 +1321,16 @@ func (s *Server) CreateCDB(ctx context.Context, req *dbdpb.CreateCDBRequest) (*d
 	if err != nil {
 		return nil, fmt.Errorf("error while running dbca command: %v", err)
 	}
-	klog.InfoS("CDB created successfully")
+	klog.InfoS("dbdaemon/CreateCDB: CDB created successfully")
 
+	if _, err := s.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
+		DatabaseName: req.GetDatabaseName(),
+	}); err != nil {
+		return nil, fmt.Errorf("dbdaemon/CreateCDB: shutdown failed: %v", err)
+	}
+
+	klog.InfoS("dbdaemon/CreateCDB successfully completed")
 	return &dbdpb.CreateCDBResponse{}, nil
 }
 
@@ -1345,7 +1347,7 @@ func (s *Server) CreateFile(ctx context.Context, req *dbdpb.CreateFileRequest) (
 func (s *Server) CreateCDBAsync(ctx context.Context, req *dbdpb.CreateCDBAsyncRequest) (*lropb.Operation, error) {
 	job, err := lro.CreateAndRunLROJobWithID(ctx, req.GetLroInput().GetOperationId(), "CreateCDB", s.lroServer,
 		func(ctx context.Context) (proto.Message, error) {
-			return s.CreateCDB(ctx, req.SyncRequest)
+			return s.createCDB(ctx, req.SyncRequest)
 		})
 
 	if err != nil {
@@ -1544,12 +1546,15 @@ func (s *Server) FileExists(ctx context.Context, req *dbdpb.FileExistsRequest) (
 	return &dbdpb.FileExistsResponse{}, err
 }
 
-// CreateDir RPC call to create a directory named path, along with any necessary parents.
-func (s *Server) CreateDir(ctx context.Context, req *dbdpb.CreateDirRequest) (*dbdpb.CreateDirResponse, error) {
-	if err := os.MkdirAll(req.GetPath(), os.FileMode(req.GetPerm())); err != nil {
-		return nil, fmt.Errorf("dbdaemon/CreateDir failed: %v", err)
+// CreateDirs RPC call to create directories along with any necessary parents.
+func (s *Server) CreateDirs(ctx context.Context, req *dbdpb.CreateDirsRequest) (*dbdpb.CreateDirsResponse, error) {
+	for _, dirInfo := range req.GetDirs() {
+		if err := os.MkdirAll(dirInfo.GetPath(), os.FileMode(dirInfo.GetPerm())); err != nil {
+			return nil, fmt.Errorf("dbdaemon/CreateDirs failed on dir %s: %v", dirInfo.GetPath(), err)
+		}
 	}
-	return &dbdpb.CreateDirResponse{}, nil
+
+	return &dbdpb.CreateDirsResponse{}, nil
 }
 
 // ReadDir RPC call to read the directory named by path and returns Fileinfos for the path and children.
@@ -1713,7 +1718,7 @@ func New(ctx context.Context, cdbNameFromYaml string) (*Server, error) {
 func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.DownloadDirectoryFromGCSRequest) (*dbdpb.DownloadDirectoryFromGCSResponse, error) {
 
 	klog.Infof("dbdaemon/DownloadDirectoryFromGCS: req %v", req)
-	bucket, prefix, err := s.gcsUtil.splitURI(req.GcsPath)
+	bucket, prefix, err := s.gcsUtil.SplitURI(req.GcsPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse gcs path %s", err)
 	}
@@ -1758,13 +1763,13 @@ func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.Downlo
 	return &dbdpb.DownloadDirectoryFromGCSResponse{}, nil
 }
 
-// FetchServiceImageMetaData fetches the image metadata from the image.
+// FetchServiceImageMetaData fetches the image metadata via the dbdaemon proxy.
 func (s *Server) FetchServiceImageMetaData(ctx context.Context, req *dbdpb.FetchServiceImageMetaDataRequest) (*dbdpb.FetchServiceImageMetaDataResponse, error) {
-	oracleHome, cdbName, version, err := provision.FetchMetaDataFromImage()
+	proxyResponse, err := s.dbdClient.ProxyFetchServiceImageMetaData(ctx, &dbdpb.ProxyFetchServiceImageMetaDataRequest{})
 	if err != nil {
-		return &dbdpb.FetchServiceImageMetaDataResponse{}, nil
+		return &dbdpb.FetchServiceImageMetaDataResponse{}, err
 	}
-	return &dbdpb.FetchServiceImageMetaDataResponse{Version: version, CdbName: cdbName, OracleHome: oracleHome}, nil
+	return &dbdpb.FetchServiceImageMetaDataResponse{Version: proxyResponse.Version, CdbName: proxyResponse.CdbName, OracleHome: proxyResponse.OracleHome, SeededImage: proxyResponse.SeededImage}, nil
 }
 
 func (s *Server) downloadFile(ctx context.Context, c *storage.Client, bucket, gcsPath, baseDir, dest string) error {
@@ -1780,15 +1785,18 @@ func (s *Server) downloadFile(ctx context.Context, c *storage.Client, bucket, gc
 	}
 
 	f := filepath.Join(dest, relPath)
+	start := time.Now()
 	if err := s.osUtil.createFile(f, reader); err != nil {
 		return fmt.Errorf("failed to createFile for file %s, err %s", f, err)
 	}
-	klog.InfoS("dbdaemon/downloadFile:", "downloaded", f)
+	end := time.Now()
+	rate := float64(reader.Attrs.Size) / (end.Sub(start).Seconds())
+	klog.InfoS("dbdaemon/downloadFile:", "downloaded", f, "throughput", fmt.Sprintf("(%f MB/s)", rate/1024/1024))
 	return nil
 }
 
-// BootstrapDatabase invokes init_oracle on dbdaemon_proxy to perform bootstrap tasks for seeded image
-func (s *Server) BootstrapDatabase(ctx context.Context, req *dbdpb.BootstrapDatabaseRequest) (*dbdpb.BootstrapDatabaseResponse, error) {
+// bootstrapDatabase invokes init_oracle on dbdaemon_proxy to perform bootstrap tasks for seeded image
+func (s *Server) bootstrapDatabase(ctx context.Context, req *dbdpb.BootstrapDatabaseRequest) (*dbdpb.BootstrapDatabaseResponse, error) {
 	cmd := "free -m | awk '/Mem/ {print $2}'"
 	out, err := exec.Command("bash", "-c", cmd).Output()
 	if err != nil {
@@ -1815,4 +1823,26 @@ func (s *Server) BootstrapDatabase(ctx context.Context, req *dbdpb.BootstrapData
 	klog.InfoS("dbdaemon/BootstrapDatabase: bootstrap database successful")
 
 	return &dbdpb.BootstrapDatabaseResponse{}, nil
+}
+
+func (s *Server) BootstrapDatabaseAsync(ctx context.Context, req *dbdpb.BootstrapDatabaseAsyncRequest) (*lropb.Operation, error) {
+	job, err := lro.CreateAndRunLROJobWithID(ctx, req.GetLroInput().GetOperationId(), "BootstrapDatabase", s.lroServer,
+		func(ctx context.Context) (proto.Message, error) {
+			return s.bootstrapDatabase(ctx, req.SyncRequest)
+		})
+
+	if err != nil {
+		klog.ErrorS(err, "dbdaemon/BootstrapDatabaseAsync failed to create an LRO job", "request", req)
+		return nil, err
+	}
+
+	return &lropb.Operation{Name: job.ID(), Done: false}, nil
+}
+
+func (s *Server) SetDnfsState(ctx context.Context, req *dbdpb.SetDnfsStateRequest) (*dbdpb.SetDnfsStateResponse, error) {
+	if _, err := s.dbdClient.SetDnfsState(ctx, &dbdpb.SetDnfsStateRequest{Enable: req.Enable}); err != nil {
+		return nil, err
+	}
+
+	return &dbdpb.SetDnfsStateResponse{}, nil
 }

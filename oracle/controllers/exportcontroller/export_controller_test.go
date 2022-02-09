@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,22 +38,30 @@ var (
 	k8sManager        ctrl.Manager
 	reconciler        *ExportReconciler
 	fakeClientFactory *testhelpers.FakeClientFactory
+
+	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestExportController(t *testing.T) {
 	fakeClientFactory = &testhelpers.FakeClientFactory{}
+	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"Export controller",
+		func() []testhelpers.Reconciler {
+			reconciler = &ExportReconciler{
+				Client:        k8sManager.GetClient(),
+				Log:           ctrl.Log.WithName("controllers").WithName("Export"),
+				Scheme:        k8sManager.GetScheme(),
+				ClientFactory: fakeClientFactory,
+				Recorder:      k8sManager.GetEventRecorderFor("export-controller"),
 
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "Export controller", func() []testhelpers.Reconciler {
-		reconciler = &ExportReconciler{
-			Client:        k8sManager.GetClient(),
-			Log:           ctrl.Log.WithName("controllers").WithName("Export"),
-			Scheme:        k8sManager.GetScheme(),
-			ClientFactory: fakeClientFactory,
-			Recorder:      k8sManager.GetEventRecorderFor("export-controller"),
-		}
+				DatabaseClientFactory: fakeDatabaseClientFactory,
+			}
 
-		return []testhelpers.Reconciler{reconciler}
-	})
+			return []testhelpers.Reconciler{reconciler}
+		})
 }
 
 var _ = Describe("Export controller", func() {
@@ -73,6 +82,7 @@ var _ = Describe("Export controller", func() {
 		dbObjKey              client.ObjectKey
 		objKey                client.ObjectKey
 		fakeConfigAgentClient *testhelpers.FakeConfigAgentClient
+		fakeDatabaseClient    *testhelpers.FakeDatabaseClient
 	)
 	ctx := context.Background()
 
@@ -120,6 +130,8 @@ var _ = Describe("Export controller", func() {
 
 		fakeClientFactory.Reset()
 		fakeConfigAgentClient = fakeClientFactory.Caclient
+		fakeDatabaseClientFactory.Reset()
+		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 	})
 
 	AfterEach(func() {
@@ -170,14 +182,14 @@ var _ = Describe("Export controller", func() {
 
 			By("verifying post-conditions")
 			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(0))
-			Expect(fakeConfigAgentClient.DeleteOperationCalledCnt()).Should(Equal(0))
+			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
 		})
 
 		It("should mark export as complete", func() {
 			SetDatabaseReadyStatus(metav1.ConditionTrue)
 
 			By("setting LRO status to Done")
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDone)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDone)
 
 			CreateExport()
 
@@ -188,14 +200,14 @@ var _ = Describe("Export controller", func() {
 
 			By("verifying post-conditions")
 			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(1))
-			Expect(fakeConfigAgentClient.DeleteOperationCalledCnt()).Should(Equal(1))
+			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(1))
 		})
 
 		It("should mark export as failed", func() {
 			SetDatabaseReadyStatus(metav1.ConditionTrue)
 
 			By("setting LRO status to DoneWithError")
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
 
 			CreateExport()
 
@@ -206,7 +218,7 @@ var _ = Describe("Export controller", func() {
 
 			By("verifying post-conditions")
 			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(1))
-			Expect(fakeConfigAgentClient.DeleteOperationCalledCnt()).Should(Equal(1))
+			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(1))
 		})
 	})
 })

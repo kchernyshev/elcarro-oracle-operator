@@ -20,12 +20,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -40,22 +40,37 @@ var (
 	k8sManager        ctrl.Manager
 	reconciler        *BackupReconciler
 	fakeClientFactory *testhelpers.FakeClientFactory
+
+	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestBackupController(t *testing.T) {
 	fakeClientFactory = &testhelpers.FakeClientFactory{}
+	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
+		[]*runtime.SchemeBuilder{
+			&v1alpha1.SchemeBuilder.SchemeBuilder,
+			// snapv1 uses runtime.SchemeBuilder
+			&snapv1.SchemeBuilder,
+		},
+		"Backup controller",
+		func() []testhelpers.Reconciler {
+			client := k8sManager.GetClient()
+			reconciler = &BackupReconciler{
+				Client:              client,
+				Log:                 ctrl.Log.WithName("controllers").WithName("Backup"),
+				Scheme:              k8sManager.GetScheme(),
+				ClientFactory:       fakeClientFactory,
+				Recorder:            k8sManager.GetEventRecorderFor("backup-controller"),
+				BackupCtrl:          &RealBackupControl{Client: k8sClient},
+				OracleBackupFactory: &RealOracleBackupFactory{},
 
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "Backup controller", func() []testhelpers.Reconciler {
-		reconciler = &BackupReconciler{
-			Client:        k8sManager.GetClient(),
-			Log:           ctrl.Log.WithName("controllers").WithName("Backup"),
-			Scheme:        k8sManager.GetScheme(),
-			ClientFactory: fakeClientFactory,
-			Recorder:      k8sManager.GetEventRecorderFor("backup-controller"),
-		}
+				DatabaseClientFactory: fakeDatabaseClientFactory,
+			}
 
-		return []testhelpers.Reconciler{reconciler}
-	})
+			return []testhelpers.Reconciler{reconciler}
+		})
 }
 
 var _ = Describe("Backup controller", func() {
@@ -105,14 +120,17 @@ var _ = Describe("Backup controller", func() {
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
 		fakeClientFactory.Reset()
+		fakeDatabaseClientFactory.Reset()
 	})
 
 	AfterEach(func() {
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, &instance)
+		objKey := client.ObjectKey{Namespace: Namespace, Name: instance.Name}
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, &instance)
 		createdBackups := &v1alpha1.BackupList{}
 		Expect(k8sClient.List(ctx, createdBackups)).Should(Succeed())
 		for _, backup := range createdBackups.Items {
-			testhelpers.K8sDeleteWithRetry(k8sClient, ctx, &backup)
+			objKey = client.ObjectKey{Namespace: Namespace, Name: backup.Name}
+			testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, &backup)
 		}
 	})
 
@@ -139,9 +157,11 @@ var _ = Describe("Backup controller", func() {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupInProgress))
 
-			var snapshots snapv1.VolumeSnapshotList
-			Expect(k8sClient.List(ctx, &snapshots, client.InNamespace(Namespace))).Should(Succeed())
-			Expect(len(snapshots.Items)).Should(Equal(2))
+			Eventually(func() int {
+				var snapshots snapv1.VolumeSnapshotList
+				Expect(k8sClient.List(ctx, &snapshots, client.InNamespace(Namespace))).Should(Succeed())
+				return len(snapshots.Items)
+			}, timeout, interval).Should(Equal(2))
 		})
 
 		It("Should mark backup as failed because of invalid instance name", func() {
@@ -195,12 +215,6 @@ var _ = Describe("Backup controller", func() {
 
 	Context("New backup through RMAN with VerifyExists mode", func() {
 		It("Should verify RMAN backup correctly", func() {
-			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
-				return nil
-			}
-			defer func() { preflightCheck = oldFunc }()
-
 			By("By creating a RMAN type backup with VerifyExists mode of the instance")
 			backup := &v1alpha1.Backup{
 				ObjectMeta: metav1.ObjectMeta{
@@ -230,21 +244,18 @@ var _ = Describe("Backup controller", func() {
 
 	Context("New backup through RMAN in LRO async environment", func() {
 		It("Should create RMAN backup correctly", func() {
-			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
-				return nil
-			}
 			oldStatusCheckInterval := statusCheckInterval
 			statusCheckInterval = interval
 			defer func() {
-				preflightCheck = oldFunc
 				statusCheckInterval = oldStatusCheckInterval
 			}()
 
 			// configure fake ConfigAgent to be in LRO mode
 			fakeConfigAgentClient := fakeClientFactory.Caclient
 			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusRunning)
+
+			fakeDatabaseClient := fakeDatabaseClientFactory.Dbclient
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusRunning)
 
 			By("By creating a RMAN type backup of the instance")
 			backup := &v1alpha1.Backup{
@@ -273,10 +284,10 @@ var _ = Describe("Backup controller", func() {
 			Expect(fakeConfigAgentClient.PhysicalBackupCalledCnt()).Should(BeNumerically(">=", 1))
 
 			By("By checking that reconciler watches backup LRO status")
-			getOperationCallsCntBefore := fakeConfigAgentClient.GetOperationCalledCnt()
+			getOperationCallsCntBefore := fakeDatabaseClient.GetOperationCalledCnt()
 
 			Eventually(func() int {
-				return fakeConfigAgentClient.GetOperationCalledCnt()
+				return fakeDatabaseClient.GetOperationCalledCnt()
 			}, timeout, interval).ShouldNot(Equal(getOperationCallsCntBefore))
 
 			var updatedBackup v1alpha1.Backup
@@ -284,26 +295,22 @@ var _ = Describe("Backup controller", func() {
 			Expect(k8s.FindCondition(updatedBackup.Status.Conditions, k8s.Ready).Reason).Should(Equal(k8s.BackupInProgress))
 
 			By("By checking that physical backup is Ready on backup LRO completion")
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDone)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDone)
+
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupReady))
 
-			Eventually(fakeConfigAgentClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
+			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 		})
 
 		It("Should mark unsuccessful RMAN backup as Failed", func() {
-			oldFunc := preflightCheck
-			preflightCheck = func(ctx context.Context, r *BackupReconciler, namespace, instName string, log logr.Logger) error {
-				return nil
-			}
-			defer func() { preflightCheck = oldFunc }()
-
 			// configure fake ConfigAgent to be in LRO mode with a
 			// failed operation result.
 			fakeConfigAgentClient := fakeClientFactory.Caclient
 			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
-			fakeConfigAgentClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
+
+			fakeDatabaseClientFactory.Dbclient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
 
 			By("By creating a RMAN type backup of the instance")
 			backup := &v1alpha1.Backup{
@@ -332,6 +339,28 @@ var _ = Describe("Backup controller", func() {
 			var inst v1alpha1.Instance
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: Namespace, Name: instance.Name}, &inst)).Should(Succeed())
 			Expect(inst.Status.BackupID).Should(Equal(""))
+		})
+	})
+
+	Context("New backup should allow section size", func() {
+		It("defaults an empty input to  0", func() {
+			backup := &v1alpha1.Backup{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: Namespace,
+					Name:      BackupName,
+				},
+				Spec: v1alpha1.BackupSpec{
+					BackupSpec: commonv1alpha1.BackupSpec{
+						Instance: instance.Name,
+						Type:     commonv1alpha1.BackupTypePhysical,
+					},
+					// SectionSize omitted
+				},
+			}
+
+			expected := int64(0)
+			actual, _ := backup.Spec.SectionSize.AsInt64()
+			Expect(actual).To(Equal((expected)))
 		})
 	})
 })

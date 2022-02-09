@@ -30,6 +30,10 @@ type DatabaseDaemonProxyClient interface {
 	SetEnv(ctx context.Context, in *SetEnvRequest, opts ...grpc.CallOption) (*SetEnvResponse, error)
 	// ProxyRunInitOracle RPC call exec init_oracle binary with specified params
 	ProxyRunInitOracle(ctx context.Context, in *ProxyRunInitOracleRequest, opts ...grpc.CallOption) (*ProxyRunInitOracleResponse, error)
+	// ProxyFetchServiceImageMetaData returns metadata from the oracledb container
+	ProxyFetchServiceImageMetaData(ctx context.Context, in *ProxyFetchServiceImageMetaDataRequest, opts ...grpc.CallOption) (*ProxyFetchServiceImageMetaDataResponse, error)
+	// SetDnfsState set dNFS state
+	SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error)
 }
 
 type databaseDaemonProxyClient struct {
@@ -94,6 +98,24 @@ func (c *databaseDaemonProxyClient) ProxyRunInitOracle(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *databaseDaemonProxyClient) ProxyFetchServiceImageMetaData(ctx context.Context, in *ProxyFetchServiceImageMetaDataRequest, opts ...grpc.CallOption) (*ProxyFetchServiceImageMetaDataResponse, error) {
+	out := new(ProxyFetchServiceImageMetaDataResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemonProxy/ProxyFetchServiceImageMetaData", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *databaseDaemonProxyClient) SetDnfsState(ctx context.Context, in *SetDnfsStateRequest, opts ...grpc.CallOption) (*SetDnfsStateResponse, error) {
+	out := new(SetDnfsStateResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemonProxy/SetDnfsState", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DatabaseDaemonProxyServer is the server API for DatabaseDaemonProxy service.
 // All implementations must embed UnimplementedDatabaseDaemonProxyServer
 // for forward compatibility
@@ -110,6 +132,10 @@ type DatabaseDaemonProxyServer interface {
 	SetEnv(context.Context, *SetEnvRequest) (*SetEnvResponse, error)
 	// ProxyRunInitOracle RPC call exec init_oracle binary with specified params
 	ProxyRunInitOracle(context.Context, *ProxyRunInitOracleRequest) (*ProxyRunInitOracleResponse, error)
+	// ProxyFetchServiceImageMetaData returns metadata from the oracledb container
+	ProxyFetchServiceImageMetaData(context.Context, *ProxyFetchServiceImageMetaDataRequest) (*ProxyFetchServiceImageMetaDataResponse, error)
+	// SetDnfsState set dNFS state
+	SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error)
 	mustEmbedUnimplementedDatabaseDaemonProxyServer()
 }
 
@@ -134,6 +160,12 @@ func (UnimplementedDatabaseDaemonProxyServer) SetEnv(context.Context, *SetEnvReq
 }
 func (UnimplementedDatabaseDaemonProxyServer) ProxyRunInitOracle(context.Context, *ProxyRunInitOracleRequest) (*ProxyRunInitOracleResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ProxyRunInitOracle not implemented")
+}
+func (UnimplementedDatabaseDaemonProxyServer) ProxyFetchServiceImageMetaData(context.Context, *ProxyFetchServiceImageMetaDataRequest) (*ProxyFetchServiceImageMetaDataResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ProxyFetchServiceImageMetaData not implemented")
+}
+func (UnimplementedDatabaseDaemonProxyServer) SetDnfsState(context.Context, *SetDnfsStateRequest) (*SetDnfsStateResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method SetDnfsState not implemented")
 }
 func (UnimplementedDatabaseDaemonProxyServer) mustEmbedUnimplementedDatabaseDaemonProxyServer() {}
 
@@ -256,6 +288,42 @@ func _DatabaseDaemonProxy_ProxyRunInitOracle_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemonProxy_ProxyFetchServiceImageMetaData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProxyFetchServiceImageMetaDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonProxyServer).ProxyFetchServiceImageMetaData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemonProxy/ProxyFetchServiceImageMetaData",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonProxyServer).ProxyFetchServiceImageMetaData(ctx, req.(*ProxyFetchServiceImageMetaDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DatabaseDaemonProxy_SetDnfsState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetDnfsStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonProxyServer).SetDnfsState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemonProxy/SetDnfsState",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonProxyServer).SetDnfsState(ctx, req.(*SetDnfsStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // DatabaseDaemonProxy_ServiceDesc is the grpc.ServiceDesc for DatabaseDaemonProxy service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -286,6 +354,14 @@ var DatabaseDaemonProxy_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ProxyRunInitOracle",
 			Handler:    _DatabaseDaemonProxy_ProxyRunInitOracle_Handler,
+		},
+		{
+			MethodName: "ProxyFetchServiceImageMetaData",
+			Handler:    _DatabaseDaemonProxy_ProxyFetchServiceImageMetaData_Handler,
+		},
+		{
+			MethodName: "SetDnfsState",
+			Handler:    _DatabaseDaemonProxy_SetDnfsState_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

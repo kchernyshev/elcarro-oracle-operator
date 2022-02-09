@@ -43,6 +43,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -70,7 +71,7 @@ type Reconciler interface {
 }
 
 // cdToRoot change to the repo root directory.
-func cdToRoot(t *testing.T) {
+func CdToRoot(t *testing.T) {
 	for {
 		if _, err := os.Stat("config/crd/bases/oracle.db.anthosapis.com_instances.yaml"); err == nil {
 			break
@@ -94,20 +95,24 @@ func RandName(base string) string {
 	return base + "-" + str[:4]
 }
 
-// RunReconcilerTestSuite runs all specs in the current package against a
+// RunFunctionalTestSuite runs all specs in the current package against a
 // specialized testing environment. Before running the suite, this function
 // configures the test environment by taking the following actions:
 //
 // * Starting a control plane consisting of an etcd process and a Kubernetes API
 //   server process.
-// * Installing CRDs into the control plane
+// * Installing CRDs into the control plane (using provided 'schemeBuilders')
 // * Starting an in-process manager in a dedicated goroutine with the given
 //   reconcilers installed in it.
 //
 // These components will be torn down after the suite runs.
-func RunReconcilerTestSuite(t *testing.T, k8sClient *client.Client, k8sManager *ctrl.Manager, description string, controllers func() []Reconciler) {
-	cdToRoot(t)
-
+func RunFunctionalTestSuite(
+	t *testing.T,
+	k8sClient *client.Client,
+	k8sManager *ctrl.Manager,
+	schemeBuilders []*runtime.SchemeBuilder,
+	description string,
+	controllers func() []Reconciler) {
 	// Define the test environment.
 	testEnv := envtest.Environment{
 		CRDDirectoryPaths: []string{
@@ -131,13 +136,9 @@ func RunReconcilerTestSuite(t *testing.T, k8sClient *client.Client, k8sManager *
 		Expect(err).ToNot(HaveOccurred())
 		Expect(cfg).ToNot(BeNil())
 
-		err = v1alpha1.AddToScheme(scheme.Scheme)
-		Expect(err).NotTo(HaveOccurred())
-
-		err = snapv1.AddToScheme(scheme.Scheme)
-		Expect(err).NotTo(HaveOccurred())
-
-		// +kubebuilder:scaffold:scheme
+		for _, sb := range schemeBuilders {
+			utilruntime.Must(sb.AddToScheme(scheme.Scheme))
+		}
 
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme:             scheme.Scheme,
@@ -186,9 +187,9 @@ var (
 // Set envtest environment pointing to that cluster
 // Create k8s client
 // Install CRDs
-// Create a new 'namespace'
+// Create the new control plane namespace
 func initK8sCluster(namespace *string) (envtest.Environment, context.Context, client.Client) {
-	cdToRoot(nil)
+	CdToRoot(nil)
 	klog.SetOutput(GinkgoWriter)
 	logf.SetLogger(klogr.NewWithOptions(klogr.WithFormat(klogr.FormatKlog)))
 
@@ -273,27 +274,36 @@ func initK8sCluster(namespace *string) (envtest.Environment, context.Context, cl
 
 // Remove namespace (and all corresponding objects).
 // Remove kubectl config.
-func cleanupK8Cluster(namespace string, k8sClient client.Client) {
-	nsObj := &corev1.Namespace{
+func cleanupK8Cluster(CPNamespace string, DPNamespace string, k8sClient client.Client) {
+	cpnsObj := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: namespace,
+			Name: CPNamespace,
 			Labels: map[string]string{
 				"control-plane": "controller-manager",
 			},
 		},
 	}
+	dpnsObj := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: DPNamespace,
+		},
+	}
 	if k8sClient != nil {
 		policy := metav1.DeletePropagationForeground
-		k8sClient.Delete(context.Background(), nsObj, &client.DeleteOptions{
+		k8sClient.Delete(context.Background(), cpnsObj, &client.DeleteOptions{
 			PropagationPolicy: &policy,
 		})
+		k8sClient.Delete(context.Background(), dpnsObj, &client.DeleteOptions{
+			PropagationPolicy: &policy,
+		})
+
 	}
-	os.Remove(fmt.Sprintf("/tmp/.kubectl/config-%v", namespace))
+	os.Remove(fmt.Sprintf("/tmp/.kubectl/config-%v", CPNamespace))
 }
 
 // PrintEvents for all namespaces in the cluster.
 func PrintEvents() {
-	cmd := exec.Command("kubectl", "get", "events", "-A", "-o", "custom-columns=LastSeen:.lastTimestamp,From:.source.component,Type:.type,Reason:.reason,Message:.message", "--sort-by=.lastTimestamp")
+	cmd := exec.Command("kubectl", "get", "events", "-A", "-o", "custom-columns=LastSeen:.metadata.creationTimestamp,From:.source.component,Type:.type,Reason:.reason,Message:.message", "--sort-by=.metadata.creationTimestamp")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		logf.FromContext(nil).Error(err, "Failed to get events")
@@ -358,10 +368,10 @@ func PrintENV() {
 // Prints cluster objects.
 // Stores Oracle trace logs to a local dir (or Prow Artifacts).
 func PrintSimpleDebugInfo(k8sEnv K8sOperatorEnvironment, instanceName string, CDBName string) {
-	PrintLogs(k8sEnv.Namespace, k8sEnv.Env, []string{"manager", "dbdaemon", "oracledb"}, []string{instanceName})
+	PrintLogs(k8sEnv.CPNamespace, k8sEnv.DPNamespace, k8sEnv.Env, []string{"manager", "dbdaemon", "oracledb"}, []string{instanceName})
 	PrintClusterObjects()
 	var pod = instanceName + "-sts-0"
-	if err := StoreOracleLogs(pod, k8sEnv.Namespace, instanceName, CDBName); err != nil {
+	if err := StoreOracleLogs(pod, k8sEnv.DPNamespace, instanceName, CDBName); err != nil {
 		logf.FromContext(nil).Error(err, "StoreOracleLogs failed")
 	}
 }
@@ -376,7 +386,7 @@ func PrintClusterObjects() {
 }
 
 // Print logs from requested containers
-func PrintLogs(namespace string, env envtest.Environment, dumpLogsFor []string, instances []string) {
+func PrintLogs(CPNamespace string, DPNamespace string, env envtest.Environment, dumpLogsFor []string, instances []string) {
 	log := logg.New(GinkgoWriter, "", 0)
 	for _, c := range dumpLogsFor {
 		var logs string
@@ -385,7 +395,7 @@ func PrintLogs(namespace string, env envtest.Environment, dumpLogsFor []string, 
 		// Make the log start a bit easier to distinguish.
 		log.Println("=============================")
 		if c == "manager" {
-			logs, err = getOperatorLogs(context.Background(), env.Config, namespace)
+			logs, err = getOperatorLogs(context.Background(), env.Config, CPNamespace)
 			if err != nil {
 				log.Printf("Failed to get %s logs: %s\n", c, err)
 			} else {
@@ -393,7 +403,7 @@ func PrintLogs(namespace string, env envtest.Environment, dumpLogsFor []string, 
 			}
 		} else {
 			for _, inst := range instances {
-				logs, err = getAgentLogs(context.Background(), env.Config, namespace, inst, c)
+				logs, err = getAgentLogs(context.Background(), env.Config, DPNamespace, inst, c)
 				if err != nil {
 					log.Printf("Failed to get %s %s logs: %s\n", inst, c, err)
 				} else {
@@ -407,20 +417,24 @@ func PrintLogs(namespace string, env envtest.Environment, dumpLogsFor []string, 
 
 // DeployOperator deploys an operator and returns a cleanup function to delete
 // all cluster level objects created outside of the namespace.
-func DeployOperator(ctx context.Context, k8sClient client.Client, namespace string) (func() error, error) {
-	var agentImageTag, agentImageRepo string
+// It also creates the data plane namespace if the data plane and control plane are separate.
+func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace string, DPNamespace string) (func() error, error) {
+	var agentImageTag, agentImageRepo, agentImageProject string
 	if agentImageTag = os.Getenv("PROW_IMAGE_TAG"); agentImageTag == "" {
 		return nil, errors.New("PROW_IMAGE_TAG envvar was not set. Did you try to test without make?")
 	}
 	if agentImageRepo = os.Getenv("PROW_IMAGE_REPO"); agentImageRepo == "" {
 		return nil, errors.New("PROW_IMAGE_REPO envar was not set. Did you try to test without make?")
 	}
+	if agentImageProject = os.Getenv("PROW_PROJECT"); agentImageProject == "" {
+		return nil, errors.New("PROW_PROJECT envar was not set. Did you try to test without make?")
+	}
 
-	dbInitImage := fmt.Sprintf("%s/%s:%s", agentImageRepo, dbInitImage, agentImageTag)
-	configAgentImage := fmt.Sprintf("%s/%s:%s", agentImageRepo, configAgentImage, agentImageTag)
-	loggingSidecarImage := fmt.Sprintf("%s/%s:%s", agentImageRepo, loggingSidecarImage, agentImageTag)
-	monitoringAgentImage := fmt.Sprintf("%s/%s:%s", agentImageRepo, monitoringAgentImage, agentImageTag)
-	operatorImage := fmt.Sprintf("%s/%s:%s", agentImageRepo, operatorImage, agentImageTag)
+	dbInitImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, dbInitImage, agentImageTag)
+	configAgentImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, configAgentImage, agentImageTag)
+	loggingSidecarImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, loggingSidecarImage, agentImageTag)
+	monitoringAgentImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, monitoringAgentImage, agentImageTag)
+	operatorImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, operatorImage, agentImageTag)
 
 	objs, err := readYamls([]string{
 		"config/manager/manager.yaml",
@@ -453,18 +467,30 @@ func DeployOperator(ctx context.Context, k8sClient client.Client, namespace stri
 		}
 	}
 
+	//Check DPNamespace against CPNamespace. If they're different, create the DPNamespace.
+	if CPNamespace != DPNamespace {
+		By("Deploying data plane in " + DPNamespace)
+		nsObj := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: DPNamespace,
+			},
+		}
+		ctx := context.Background()
+		Expect(k8sClient.Create(ctx, nsObj)).Should(Succeed())
+	}
+
 	// Add in our overrides.
-	cr.ObjectMeta.Name = "manager-role-" + namespace
-	crb.ObjectMeta.Name = "manager-rolebinding-" + namespace
+	cr.ObjectMeta.Name = "manager-role-" + CPNamespace
+	crb.ObjectMeta.Name = "manager-rolebinding-" + CPNamespace
 	crb.RoleRef.Name = cr.ObjectMeta.Name
-	crb.Subjects[0].Namespace = namespace
-	d.Namespace = namespace
+	crb.Subjects[0].Namespace = CPNamespace
+	d.Namespace = CPNamespace
 	d.Spec.Template.Spec.Containers[0].Image = operatorImage
 	d.Spec.Template.Spec.Containers[0].ImagePullPolicy = corev1.PullAlways
 	d.Spec.Template.Spec.Containers[0].Args = []string{
 		"--logtostderr=true",
 		"--enable-leader-election=false",
-		"--namespace=" + namespace,
+		"--namespace=" + DPNamespace,
 		"--db_init_image_uri=" + dbInitImage,
 		"--config_image_uri=" + configAgentImage,
 		"--logging_sidecar_image_uri=" + loggingSidecarImage,
@@ -489,7 +515,7 @@ func DeployOperator(ctx context.Context, k8sClient client.Client, namespace stri
 	}
 
 	// Ensure deployment succeeds.
-	instKey := client.ObjectKey{Namespace: namespace, Name: d.Name}
+	instKey := client.ObjectKey{Namespace: CPNamespace, Name: d.Name}
 	Eventually(func() int {
 		err := k8sClient.Get(ctx, instKey, d)
 		if err != nil {
@@ -644,7 +670,8 @@ AfterEach(func() {
 */
 type K8sOperatorEnvironment struct {
 	Env               envtest.Environment
-	Namespace         string
+	CPNamespace       string
+	DPNamespace       string
 	Ctx               context.Context
 	K8sClient         client.Client
 	OperCleanup       func() error // Operator deployment cleanup callback.
@@ -652,21 +679,22 @@ type K8sOperatorEnvironment struct {
 	K8sServiceAccount string
 }
 
-// Init the environment, install CRDs, deploy operator, create 'namespace'.
-func (k8sEnv *K8sOperatorEnvironment) Init(namespace string) {
+// Init the environment, install CRDs, deploy operator, declare namespaces for control plane and data plane.
+func (k8sEnv *K8sOperatorEnvironment) Init(CPNamespace string, DPNamespace string) {
 	// K8S Service account
-	k8sEnv.K8sServiceAccount = os.Getenv("PROW_PROJECT") + ".svc.id.goog[" + namespace + "/default]"
+	k8sEnv.K8sServiceAccount = os.Getenv("PROW_PROJECT") + ".svc.id.goog[" + CPNamespace + "/default]"
 
-	By("Starting control plane " + namespace)
+	By("Starting control plane " + CPNamespace)
 	// Init cluster
-	k8sEnv.Namespace = namespace
-	k8sEnv.Env, k8sEnv.Ctx, k8sEnv.K8sClient = initK8sCluster(&k8sEnv.Namespace)
+	k8sEnv.CPNamespace = CPNamespace
+	k8sEnv.DPNamespace = DPNamespace
+	k8sEnv.Env, k8sEnv.Ctx, k8sEnv.K8sClient = initK8sCluster(&k8sEnv.CPNamespace)
 	// Deploy operator
-	By("Deploying operator " + namespace)
+	By("Deploying operator in " + CPNamespace)
 	// Deploy Operator, retry if necessary
 	Expect(retry.OnError(retry.DefaultBackoff, func(error) bool { return true }, func() error {
 		var err error
-		k8sEnv.OperCleanup, err = DeployOperator(k8sEnv.Ctx, k8sEnv.K8sClient, k8sEnv.Namespace)
+		k8sEnv.OperCleanup, err = deployOperator(k8sEnv.Ctx, k8sEnv.K8sClient, k8sEnv.CPNamespace, k8sEnv.DPNamespace)
 		if err != nil {
 			logf.FromContext(nil).Error(err, "DeployOperator failed, retrying")
 		}
@@ -676,22 +704,23 @@ func (k8sEnv *K8sOperatorEnvironment) Init(namespace string) {
 
 // Close cleans cluster objects and uninstalls operator.
 func (k8sEnv *K8sOperatorEnvironment) Close() {
-	if k8sEnv.Namespace == "" {
+	if k8sEnv.CPNamespace == "" && k8sEnv.DPNamespace == "" {
 		return
 	}
-	By("Stopping control plane " + k8sEnv.Namespace)
+	By("Stopping control plane " + k8sEnv.CPNamespace)
 	Expect(k8sEnv.Env.Stop()).To(Succeed())
 
 	if k8sEnv.OperCleanup != nil {
-		By("Uninstalling operator " + k8sEnv.Namespace)
+		By("Uninstalling operator " + k8sEnv.CPNamespace)
 		k8sEnv.OperCleanup()
 	}
 	if k8sEnv.K8sClient == nil {
 		return
 	}
 
-	cleanupK8Cluster(k8sEnv.Namespace, k8sEnv.K8sClient)
-	k8sEnv.Namespace = ""
+	cleanupK8Cluster(k8sEnv.CPNamespace, k8sEnv.DPNamespace, k8sEnv.K8sClient)
+	k8sEnv.CPNamespace = ""
+	k8sEnv.DPNamespace = ""
 }
 
 // Instance-specific helper functions.
@@ -734,23 +763,6 @@ func TestImageForVersion(version string, edition string, extra string) string {
 						}
 					}
 				}
-			case "12.2":
-				{
-					switch extra {
-					case "31741641-unseeded":
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_12_2_EE_UNSEEDED_31741641")
-						}
-					case "seeded-gcloud-buggy":
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_12_2_EE_SEEDED_BUGGY")
-						}
-					default:
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_12_2_EE_SEEDED")
-						}
-					}
-				}
 			}
 		}
 	}
@@ -764,7 +776,7 @@ func CreateSimpleInstance(k8sEnv K8sOperatorEnvironment, instanceName string, ve
 	instance := &v1alpha1.Instance{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      instanceName,
-			Namespace: k8sEnv.Namespace,
+			Namespace: k8sEnv.DPNamespace,
 		},
 		Spec: v1alpha1.InstanceSpec{
 			CDBName: "GCLOUD",
@@ -773,11 +785,11 @@ func CreateSimpleInstance(k8sEnv K8sOperatorEnvironment, instanceName string, ve
 				Disks: []commonv1alpha1.DiskSpec{
 					{
 						Name: "DataDisk",
-						Size: resource.MustParse("100Gi"),
+						Size: resource.MustParse("45Gi"),
 					},
 					{
 						Name: "LogDisk",
-						Size: resource.MustParse("150Gi"),
+						Size: resource.MustParse("55Gi"),
 					},
 				},
 				DatabaseResources: corev1.ResourceRequirements{
@@ -793,7 +805,7 @@ func CreateSimpleInstance(k8sEnv K8sOperatorEnvironment, instanceName string, ve
 	}
 
 	K8sCreateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx, instance)
-	instKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: instanceName}
+	instKey := client.ObjectKey{Namespace: k8sEnv.DPNamespace, Name: instanceName}
 
 	// Wait until the instance is "Ready" (requires 5+ minutes to download image).
 	WaitForInstanceConditionState(k8sEnv, instKey, k8s.Ready, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
@@ -805,11 +817,11 @@ func CreateSimplePdbWithDbObj(k8sEnv K8sOperatorEnvironment, database *v1alpha1.
 	K8sCreateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx, database)
 	// Wait for the PDB to come online (UserReady = "SyncComplete").
 	emptyObj := &v1alpha1.Database{}
-	objectKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: database.Name}
+	objectKey := client.ObjectKey{Namespace: k8sEnv.DPNamespace, Name: database.Name}
 	WaitForObjectConditionState(k8sEnv, objectKey, emptyObj, k8s.UserReady, metav1.ConditionTrue, k8s.SyncComplete, 7*time.Minute)
 
 	// Open PDBs.
-	out := K8sExecuteSqlOrFail(pod, k8sEnv.Namespace, "alter pluggable database all open;")
+	out := K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, "alter pluggable database all open;")
 	Expect(out).To(Equal(""))
 }
 
@@ -818,7 +830,7 @@ func CreateSimplePdbWithDbObj(k8sEnv K8sOperatorEnvironment, database *v1alpha1.
 func CreateSimplePDB(k8sEnv K8sOperatorEnvironment, instanceName string) {
 	CreateSimplePdbWithDbObj(k8sEnv, &v1alpha1.Database{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: k8sEnv.Namespace,
+			Namespace: k8sEnv.DPNamespace,
 			Name:      "pdb1",
 		},
 		Spec: v1alpha1.DatabaseSpec{
@@ -851,7 +863,7 @@ alter session set current_schema=scott;
 create table test_table (name varchar(100));
 insert into test_table values ('Hello World');
 commit;`
-	out := K8sExecuteSqlOrFail(pod, k8sEnv.Namespace, sql)
+	out := K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, sql)
 	Expect(out).To(Equal(""))
 }
 
@@ -861,7 +873,7 @@ func VerifySimpleData(k8sEnv K8sOperatorEnvironment) {
 	sql := `alter session set container=pdb1;
 alter session set current_schema=scott;
 select name from test_table;`
-	Expect(K8sExecuteSqlOrFail(pod, k8sEnv.Namespace, sql)).To(Equal("Hello World"))
+	Expect(K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, sql)).To(Equal("Hello World"))
 }
 
 // WaitForObjectConditionState waits until the k8s object condition object status = targetStatus
@@ -877,20 +889,26 @@ func WaitForObjectConditionState(k8sEnv K8sOperatorEnvironment,
 	timeout time.Duration) {
 	Eventually(func() bool {
 		K8sGetWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx, key, emptyObj)
+		failed := false
 		cond := &metav1.Condition{}
 		switch emptyObj.(type) {
 		case *v1alpha1.Instance:
-			cond = k8s.FindCondition(emptyObj.(*v1alpha1.Instance).Status.Conditions, condition)
+			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Instance).Status.Conditions, condition)
 		case *v1alpha1.Import:
-			cond = k8s.FindCondition(emptyObj.(*v1alpha1.Import).Status.Conditions, condition)
+			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Import).Status.Conditions, condition)
 		case *v1alpha1.Export:
-			cond = k8s.FindCondition(emptyObj.(*v1alpha1.Export).Status.Conditions, condition)
+			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Export).Status.Conditions, condition)
 		case *v1alpha1.Database:
-			cond = k8s.FindCondition(emptyObj.(*v1alpha1.Database).Status.Conditions, condition)
+			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Database).Status.Conditions, condition)
 		}
 		if cond != nil {
 			logf.FromContext(nil).Info(fmt.Sprintf("Waiting %v, status=%v:%v, expecting=%v:%v", condition, cond.Status, cond.Reason, targetStatus, targetReason))
-			return cond.Status == targetStatus && cond.Reason == targetReason
+			done := cond.Status == targetStatus && cond.Reason == targetReason
+			if !done && failed { // Allow for expecting a "Failed" condition.
+				Fail(fmt.Sprintf("Failed %v, status=%v:%v, expecting=%v:%v", condition, cond.Status, cond.Reason, targetStatus, targetReason))
+			}
+			return done
+
 		}
 		return false
 	}, timeout, 5*time.Second).Should(Equal(true))
@@ -1000,81 +1018,120 @@ EOF
 // Helper functions for functional and integration tests.
 // Uses ginkgo asserts.
 
-const retryTimeout = time.Second * 5
-const retryInterval = time.Second * 1
+const RetryTimeout = time.Second * 5
+const RetryInterval = time.Second * 1
 
 // K8sCreateWithRetry calls k8s Create() with retry as k8s might require this in some cases (e.g. conflicts).
 func K8sCreateWithRetry(k8sClient client.Client, ctx context.Context, obj client.Object) {
 	Eventually(
 		func() error {
 			return k8sClient.Create(ctx, obj)
-		}, retryTimeout, retryInterval).Should(Succeed())
+		}, RetryTimeout, RetryInterval).Should(Succeed())
 }
 
 // K8sGetWithRetry calls k8s Get() with retry as k8s might require this in some cases (e.g. conflicts).
-func K8sGetWithRetry(k8sClient client.Client, ctx context.Context, instKey client.ObjectKey, obj client.Object) {
+func K8sGetWithRetry(k8sClient client.Client, ctx context.Context, objKey client.ObjectKey, obj client.Object) {
 	Eventually(
 		func() error {
-			return k8sClient.Get(ctx, instKey, obj)
-		}, retryTimeout, retryInterval).Should(Succeed())
+			return k8sClient.Get(ctx, objKey, obj)
+		}, RetryTimeout, RetryInterval).Should(Succeed())
 }
 
-// K8sDeleteWithRetry calls k8s Delete() with retry as k8s might require this in some cases (e.g. conflicts).
-func K8sDeleteWithRetry(k8sClient client.Client, ctx context.Context, obj client.Object) {
+// K8sDeleteWithRetryNoWait calls k8s Delete() with retry as k8s might require
+// this in some cases (e.g. conflicts).
+func K8sDeleteWithRetryNoWait(k8sClient client.Client, ctx context.Context, objKey client.ObjectKey, obj client.Object) {
 	Eventually(
 		func() error {
 			return k8sClient.Delete(ctx, obj)
-		}, retryTimeout, retryInterval).Should(Succeed())
+		}, RetryTimeout, RetryInterval).Should(Succeed())
 }
 
-// Simple helper to make the Get-Modify-Update-Retry cycle easier
-// Get a fresh version of the object into 'emptyObj' using 'objKey'
-// Apply user-supplied modifyObjectFunc() which should modify the 'emptyObj'
-// Try to update 'emptyObj' in k8s, retry if needed
-func K8sGetAndUpdateWithRetry(k8sClient client.Client,
+// K8sDeleteWithRetry calls k8s Delete() with retry as k8s might require
+// this in some cases (e.g. conflicts).
+// Waits until the object gets deleted.
+// Important: namespace objects never get completely deleted in testenv,
+// use K8sDeleteWithRetryNoWait for deleting them
+// https://github.com/kubernetes-sigs/controller-runtime/issues/880
+func K8sDeleteWithRetry(k8sClient client.Client, ctx context.Context, objKey client.ObjectKey, obj client.Object) {
+	Eventually(
+		func() error {
+			return k8sClient.Delete(ctx, obj)
+		}, RetryTimeout, RetryInterval).Should(Succeed())
+
+	Eventually(
+		func() error {
+			return k8sClient.Get(ctx, objKey, obj)
+		}, RetryTimeout, RetryInterval).Should(Not(Succeed()))
+}
+
+// Get a fresh version of the object into 'emptyObj' using 'objKey'.
+// Apply user-supplied modifyObjectFunc() which should modify the 'emptyObj'.
+// Try to update 'emptyObj' in k8s, retry if needed.
+// Wait until the object gets updated.
+func k8sUpdateWithRetryHelper(k8sClient client.Client,
 	ctx context.Context,
 	objKey client.ObjectKey,
 	emptyObj client.Object,
-	modifyObjectFunc func(*client.Object)) {
-
+	modifyObjectFunc func(*client.Object),
+	updateStatus bool) {
+	originalRV := ""
 	Eventually(
 		func() error {
 			// Get a fresh version of the object
 			K8sGetWithRetry(k8sClient, ctx, objKey, emptyObj)
+			// Save resource version
+			originalRV = emptyObj.GetResourceVersion()
 			// Apply modifyObjectFunc()
 			modifyObjectFunc(&emptyObj)
-			// Try to update object in k8s
-			if err := k8sClient.Update(ctx, emptyObj); err != nil {
-				logf.FromContext(nil).Error(err, "Failed to update object, retrying")
-				return err
+			if updateStatus {
+				// Try to update status in k8s
+				if err := k8sClient.Status().Update(ctx, emptyObj); err != nil {
+					logf.FromContext(nil).Error(err, "Failed to update object, retrying")
+					return err
+				}
+			} else {
+				// Try to update object in k8s
+				if err := k8sClient.Update(ctx, emptyObj); err != nil {
+					logf.FromContext(nil).Error(err, "Failed to update object, retrying")
+					return err
+				}
 			}
 			return nil
-		}, retryTimeout, retryInterval).Should(Succeed())
+		}, RetryTimeout, RetryInterval).Should(Succeed())
+
+	// Wait until RV has changed
+	Eventually(
+		func() string {
+			// Get a fresh version of the object
+			K8sGetWithRetry(k8sClient, ctx, objKey, emptyObj)
+			return emptyObj.GetResourceVersion()
+		}, RetryTimeout, RetryInterval).Should(Not(Equal(originalRV)))
 }
 
-// Simple helper to make the Get-Modify-UpdateStatus-Retry cycle easier
+// K8sUpdate makes the Get-Modify-Update-Retry cycle easier.
+// Get a fresh version of the object into 'emptyObj' using 'objKey'.
+// Apply user-supplied modifyObjectFunc() which should modify the 'emptyObj'.
+// Try to update 'emptyObj' in k8s, retry if needed.
+// Wait until the object gets updated.
+func K8sUpdateWithRetry(k8sClient client.Client,
+	ctx context.Context,
+	objKey client.ObjectKey,
+	emptyObj client.Object,
+	modifyObjectFunc func(*client.Object)) {
+	k8sUpdateWithRetryHelper(k8sClient, ctx, objKey, emptyObj, modifyObjectFunc, false)
+}
+
+// K8sUpdateStatus makes the Get-Modify-UpdateStatus-Retry cycle easier
 // Get a fresh version of the object into 'emptyObj' using 'objKey'
 // Apply user-supplied modifyObjectFunc() which should modify the 'emptyObj'
 // Try to update 'emptyObj' status in k8s, retry if needed
-func K8sGetAndUpdateStatusWithRetry(k8sClient client.Client,
+// Wait until the object gets updated.
+func K8sUpdateStatusWithRetry(k8sClient client.Client,
 	ctx context.Context,
 	objKey client.ObjectKey,
 	emptyObj client.Object,
 	modifyObjectFunc func(*client.Object)) {
-
-	Eventually(
-		func() error {
-			// Get a fresh version of the object
-			K8sGetWithRetry(k8sClient, ctx, objKey, emptyObj)
-			// Apply modifyObjectFunc()
-			modifyObjectFunc(&emptyObj)
-			// Try to update status in k8s
-			if err := k8sClient.Status().Update(ctx, emptyObj); err != nil {
-				logf.FromContext(nil).Error(err, "Failed to update object, retrying")
-				return err
-			}
-			return nil
-		}, retryTimeout, retryInterval).Should(Succeed())
+	k8sUpdateWithRetryHelper(k8sClient, ctx, objKey, emptyObj, modifyObjectFunc, true)
 }
 
 // K8sCreateAndGet calls k8s Create() with retry and then wait for the object to be created.
@@ -1084,7 +1141,22 @@ func K8sCreateAndGet(k8sClient client.Client, ctx context.Context, objKey client
 	Eventually(
 		func() error {
 			return k8sClient.Get(ctx, objKey, createdObj)
-		}, retryTimeout, retryInterval).Should(Succeed())
+		}, RetryTimeout, RetryInterval).Should(Succeed())
+}
+
+// K8sWaitForUpdate waits until GetResourceVersion changes
+// compared to 'originalRV'. Updates 'emptyObj' with the new object.
+func K8sWaitForUpdate(k8sClient client.Client,
+	ctx context.Context,
+	objKey client.ObjectKey,
+	emptyObj client.Object,
+	originalRV string) {
+	Eventually(
+		func() string {
+			// Get a fresh version of the object
+			K8sGetWithRetry(k8sClient, ctx, objKey, emptyObj)
+			return emptyObj.GetResourceVersion()
+		}, RetryTimeout, RetryInterval).Should(Not(Equal(originalRV)))
 }
 
 // SetupServiceAccountBindingBetweenGcpAndK8s creates IAM policy binding between
@@ -1102,8 +1174,8 @@ func SetupServiceAccountBindingBetweenGcpAndK8s(k8sEnv K8sOperatorEnvironment) {
 		return err
 	})).To(Succeed())
 	saObj := &corev1.ServiceAccount{}
-	K8sGetAndUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
-		client.ObjectKey{Namespace: k8sEnv.Namespace, Name: "default"},
+	K8sUpdateWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx,
+		client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: "default"},
 		saObj,
 		func(obj *client.Object) {
 			// Add service account annotation.
@@ -1149,4 +1221,10 @@ func StoreOracleLogs(pod string, ns string, instanceName string, CDBName string)
 	}
 	logf.FromContext(nil).Info(fmt.Sprintf("Stored Oracle /trace/ to %s", storePath))
 	return nil
+}
+
+// Returns true if 'PROW_CANARY_JOB' env is set.
+// Canary Job is supposed to host all long-running tests.
+func IsCanaryJob() bool {
+	return os.Getenv("PROW_CANARY_JOB") != ""
 }

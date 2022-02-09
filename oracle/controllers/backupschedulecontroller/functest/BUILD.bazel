@@ -4,6 +4,7 @@ go_test(
     name = "functest_test",
     size = "medium",
     srcs = ["backupschedule_controller_functional_test.go"],
+    tags = ["functional"],
     deps = [
         "//common/api/v1alpha1",
         "//oracle/api/v1alpha1",
@@ -15,6 +16,7 @@ go_test(
         "@com_github_onsi_gomega//:gomega",
         "@io_k8s_apimachinery//pkg/api/errors",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
         "@io_k8s_sigs_controller_runtime//:controller-runtime",
         "@io_k8s_sigs_controller_runtime//pkg/client",
         "@io_k8s_sigs_controller_runtime//pkg/reconcile",

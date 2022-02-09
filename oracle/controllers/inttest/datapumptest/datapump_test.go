@@ -50,7 +50,7 @@ var _ = Describe("Datapump", func() {
 	BeforeEach(func() {
 		defer GinkgoRecover()
 		namespace = testhelpers.RandName("datapump-test")
-		k8sEnv.Init(namespace)
+		k8sEnv.Init(namespace, namespace)
 
 		// Allow the k8s [namespace/default] service account access to GCS buckets
 		testhelpers.SetupServiceAccountBindingBetweenGcpAndK8s(k8sEnv)
@@ -67,7 +67,7 @@ var _ = Describe("Datapump", func() {
 		It("Should create instance and export data", func() {
 			testhelpers.CreateSimpleInstance(k8sEnv, instanceName, version, edition)
 
-			instKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: instanceName}
+			instKey := client.ObjectKey{Namespace: k8sEnv.DPNamespace, Name: instanceName}
 			testhelpers.WaitForInstanceConditionState(k8sEnv, instKey, k8s.DatabaseInstanceReady, metav1.ConditionTrue, k8s.CreateComplete, 20*time.Minute)
 
 			testhelpers.CreateSimplePDB(k8sEnv, instanceName)
@@ -95,9 +95,9 @@ var _ = Describe("Datapump", func() {
 			By("Waiting for export to complete")
 			{
 				createdExport := &v1alpha1.Export{}
-				objKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: schemaExport.Name}
+				objKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: schemaExport.Name}
 				testhelpers.WaitForObjectConditionState(k8sEnv,
-					objKey, createdExport, k8s.Ready, metav1.ConditionTrue, k8s.ExportComplete, 2*time.Minute)
+					objKey, createdExport, k8s.Ready, metav1.ConditionTrue, k8s.ExportComplete, 5*time.Minute)
 			}
 
 			By("Creating a new Table export")
@@ -122,15 +122,15 @@ var _ = Describe("Datapump", func() {
 			By("Waiting for export to complete")
 			{
 				createdExport := &v1alpha1.Export{}
-				objKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: tableExport.Name}
+				objKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: tableExport.Name}
 				testhelpers.WaitForObjectConditionState(k8sEnv,
-					objKey, createdExport, k8s.Ready, metav1.ConditionTrue, k8s.ExportComplete, 2*time.Minute)
+					objKey, createdExport, k8s.Ready, metav1.ConditionTrue, k8s.ExportComplete, 5*time.Minute)
 			}
 
 			By("Erasing scott user")
 			sql := `alter session set container=pdb1;
 drop user scott cascade;`
-			testhelpers.K8sExecuteSqlOrFail(pod, k8sEnv.Namespace, sql)
+			testhelpers.K8sExecuteSqlOrFail(pod, k8sEnv.CPNamespace, sql)
 
 			By("Importing Schemas")
 			schemaImport := &v1alpha1.Import{
@@ -149,9 +149,9 @@ drop user scott cascade;`
 			By("Waiting for schema import to complete")
 			{
 				createdImport := &v1alpha1.Import{}
-				objKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: schemaImport.Name}
+				objKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: schemaImport.Name}
 				testhelpers.WaitForObjectConditionState(k8sEnv,
-					objKey, createdImport, k8s.Ready, metav1.ConditionTrue, k8s.ImportComplete, 2*time.Minute)
+					objKey, createdImport, k8s.Ready, metav1.ConditionTrue, k8s.ImportComplete, 5*time.Minute)
 			}
 
 			By("Granting unlimited tablespace to scott")
@@ -159,7 +159,7 @@ drop user scott cascade;`
 grant unlimited tablespace to scott;
 alter session set current_schema=scott;
 drop table test_table;`
-			testhelpers.K8sExecuteSqlOrFail(pod, k8sEnv.Namespace, sql)
+			testhelpers.K8sExecuteSqlOrFail(pod, k8sEnv.CPNamespace, sql)
 
 			By("Importing Tables")
 			tableImport := &v1alpha1.Import{
@@ -177,18 +177,14 @@ drop table test_table;`
 			By("Waiting for table import to complete")
 			{
 				createdImport := &v1alpha1.Import{}
-				objKey := client.ObjectKey{Namespace: k8sEnv.Namespace, Name: tableImport.Name}
+				objKey := client.ObjectKey{Namespace: k8sEnv.CPNamespace, Name: tableImport.Name}
 				testhelpers.WaitForObjectConditionState(k8sEnv,
-					objKey, createdImport, k8s.Ready, metav1.ConditionTrue, k8s.ImportComplete, 2*time.Minute)
+					objKey, createdImport, k8s.Ready, metav1.ConditionTrue, k8s.ImportComplete, 5*time.Minute)
 			}
 
 			testhelpers.VerifySimpleData(k8sEnv)
 		})
 	}
-
-	Context("Oracle 12c", func() {
-		testDataPump("12.2", "EE")
-	})
 
 	Context("Oracle 19c", func() {
 		testDataPump("19.3", "EE")

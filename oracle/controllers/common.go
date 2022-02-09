@@ -29,8 +29,10 @@ import (
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common"
 	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 )
 
 const (
@@ -76,7 +78,6 @@ var (
 			Size: resource.MustParse("100Gi"),
 		},
 	}
-
 	defaultDiskMountLocations = map[string]string{
 		"DataDisk":   "u02",
 		"LogDisk":    "u03",
@@ -129,6 +130,19 @@ type ConfigAgentClientFactory interface {
 	New(ctx context.Context, r client.Reader, namespace, instName string) (capb.ConfigAgentClient, ConnCloseFunc, error)
 }
 
+//
+type GRPCDatabaseClientFactory struct {
+	dbclient *dbdpb.DatabaseDaemonClient
+}
+
+// DatabaseClientFactory is a GRPC implementation of DatabaseClientFactory. Exists for test mock.
+type DatabaseClientFactory interface {
+	// New returns new Client.
+	// connection close function should be invoked by the caller if
+	// error is nil.
+	New(ctx context.Context, r client.Reader, namespace, instName string) (dbdpb.DatabaseDaemonClient, func() error, error)
+}
+
 // GetPVCNameAndMount returns PVC names and their corresponding mount.
 func GetPVCNameAndMount(instName, diskName string) (string, string) {
 	spec := defaultDiskSpecs[diskName]
@@ -148,6 +162,21 @@ func (g *GrpcConfigAgentClientFactory) New(ctx context.Context, r client.Reader,
 		return nil, nil, fmt.Errorf("failed to create a conn via gRPC.Dial: %w", err)
 	}
 	return capb.NewConfigAgentClient(conn), func() { _ = conn.Close() }, nil
+}
+
+// New returns a new database daemon client
+func (d *GRPCDatabaseClientFactory) New(ctx context.Context, r client.Reader, namespace, instName string) (dbdpb.DatabaseDaemonClient, func() error, error) {
+	var dbservice = fmt.Sprintf(DbdaemonSvcName, instName)
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: dbservice, Namespace: namespace}, svc); err != nil {
+		return nil, nil, err
+	}
+
+	conn, err := common.DatabaseDaemonDialService(ctx, fmt.Sprintf("%s:%d", svc.Spec.ClusterIP, consts.DefaultDBDaemonPort), grpc.WithBlock())
+	if err != nil {
+		return nil, func() error { return nil }, err
+	}
+	return dbdpb.NewDatabaseDaemonClient(conn), conn.Close, nil
 }
 
 // Contains check whether given "elem" presents in "array"

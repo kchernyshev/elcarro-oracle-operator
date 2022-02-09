@@ -40,13 +40,13 @@ sanity_check_params() {
     if [ -z "${CDB_NAME}" ]; then
       CDB_NAME="GCLOUD"
     fi
-    db_name_len=`expr length "${CDB_NAME}"`
+    db_name_len="${#CDB_NAME}"
     if [[ "${db_name_len}" -le 0 || "${db_name_len}" -gt 8 ]]; then
       echo "CDB_NAME should be less than or equal to 8 characters"
       usage
     fi
   else
-    db_name_len=`expr length "${CDB_NAME}"`
+    db_name_len="${#CDB_NAME}"
     if [[ "${db_name_len}" -gt 0 ]]; then
       echo "CDB_NAME is set but CREATE_CDB is not"
       usage
@@ -108,8 +108,8 @@ usage() {
 
      --patch_version
        Version of the Oracle database PSU.
-       If unspecified, 31312468 is used as the default value for 12.2 ,
-       31281355 is used as the default value for 19.3 .
+       If unspecified, 31741641 is used as the default value for 12.2 ,
+       32545013 is used as the default value for 19.3 .
        This flag is not supported for Oracle 18c and will be ignored.
 
      --local_build
@@ -238,7 +238,7 @@ execute_command() {
     IMAGE_NAME_SUFFIX="seeded-${IMAGE_NAME_SUFFIX}"
   else
     IMAGE_NAME_SUFFIX="unseeded"
-    CDB_NAME="${DUMMY_VALUE}"
+    CDB_NAME=""
   fi
 
   if [ "${DB_VERSION}" == "${ORACLE_18}" ] && [ "${EDITION}" == "xe" ]; then
@@ -254,7 +254,7 @@ execute_command() {
   fi
 
   if [ "${LOCAL_BUILD}" == true ]; then
-    BUILD_CMD=$(echo docker build --no-cache --build-arg=DB_VERSION=${DB_VERSION} --build-arg=ORACLE_HOME=${ORACLE_HOME} --build-arg=ORACLE_BASE=${ORACLE_BASE} --build-arg=CREATE_CDB=${CREATE_CDB} --build-arg=CDB_NAME=${CDB_NAME} --build-arg=CHARACTER_SET=${CHARACTER_SET} --build-arg=MEM_PCT=${MEM_PCT} --build-arg=EDITION=${EDITION} --build-arg=PATCH_VERSION=${PATCH_VERSION} --tag=$TAG .)
+    BUILD_CMD=$(echo docker build --no-cache --build-arg=DB_VERSION="${DB_VERSION}" --build-arg=ORACLE_HOME="${ORACLE_HOME}" --build-arg=ORACLE_BASE="${ORACLE_BASE}" --build-arg=CREATE_CDB="${CREATE_CDB}" --build-arg=CDB_NAME="${CDB_NAME}" --build-arg=CHARACTER_SET="${CHARACTER_SET}" --build-arg=MEM_PCT="${MEM_PCT}" --build-arg=EDITION="${EDITION}" --build-arg=PATCH_VERSION="${PATCH_VERSION}" --tag="$TAG" .)
   else
     if [ "${DB_VERSION}" == "${ORACLE_18}" ]; then
       BUILD_CMD=$(echo gcloud builds submit --project=${PROJECT_ID} --config=cloudbuild-18c-xe.yaml --substitutions=_ORACLE_HOME="${ORACLE_HOME}",_ORACLE_BASE="${ORACLE_BASE}",_CDB_NAME="${CDB_NAME}",_CHARACTER_SET="${CHARACTER_SET}",_TAG="${TAG}")

@@ -24,10 +24,10 @@ import (
 	"strings"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
-	"github.com/golang/protobuf/ptypes/empty"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 	lropb "google.golang.org/genproto/googleapis/longrunning"
 	"google.golang.org/grpc"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/backup"
@@ -208,6 +208,7 @@ func (s *ConfigServer) PhysicalBackup(ctx context.Context, req *pb.PhysicalBacku
 	defer closeConn()
 	klog.InfoS("configagent/PhysicalBackup", "client", client)
 
+	sectionSize := resource.NewQuantity(int64(req.GetSectionSize()), resource.DecimalSI)
 	return backup.PhysicalBackup(ctx, &backup.Params{
 		Client:       client,
 		Granularity:  granularity,
@@ -217,7 +218,7 @@ func (s *ConfigServer) PhysicalBackup(ctx context.Context, req *pb.PhysicalBacku
 		DOP:          req.GetDop(),
 		Level:        req.GetLevel(),
 		Filesperset:  req.GetFilesperset(),
-		SectionSize:  req.GetSectionSize(),
+		SectionSize:  *sectionSize,
 		LocalPath:    req.GetLocalPath(),
 		GCSPath:      req.GetGcsPath(),
 		OperationID:  req.GetLroInput().GetOperationId(),
@@ -233,28 +234,25 @@ func (s *ConfigServer) CreateCDB(ctx context.Context, req *pb.CreateCDBRequest) 
 	}
 	defer closeConn()
 
-	_, err = dbdClient.CreateCDB(ctx, &dbdpb.CreateCDBRequest{
-		OracleHome:       req.GetOracleHome(),
-		DatabaseName:     req.GetSid(),
-		Version:          req.GetVersion(),
-		DbUniqueName:     req.GetDbUniqueName(),
-		CharacterSet:     req.GetCharacterSet(),
-		MemoryPercent:    req.GetMemoryPercent(),
-		AdditionalParams: req.GetAdditionalParams(),
-		DbDomain:         req.GetDbDomain(),
+	lro, err := dbdClient.CreateCDBAsync(ctx, &dbdpb.CreateCDBAsyncRequest{
+		SyncRequest: &dbdpb.CreateCDBRequest{
+			OracleHome:       req.GetOracleHome(),
+			DatabaseName:     req.GetSid(),
+			Version:          req.GetVersion(),
+			DbUniqueName:     req.GetDbUniqueName(),
+			CharacterSet:     req.GetCharacterSet(),
+			MemoryPercent:    req.GetMemoryPercent(),
+			AdditionalParams: req.GetAdditionalParams(),
+			DbDomain:         req.GetDbDomain(),
+		},
+		LroInput: &dbdpb.LROInput{OperationId: req.GetLroInput().GetOperationId()},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("configagent/CreateCDB: failed to create CDB: %v", err)
 	}
 
-	if _, err := dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
-		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
-		DatabaseName: req.GetSid(),
-	}); err != nil {
-		return nil, fmt.Errorf("configagent/CreateCDB: shutdown failed: %v", err)
-	}
 	klog.InfoS("configagent/CreateCDB successfully completed")
-	return &lropb.Operation{Done: true}, nil
+	return lro, nil
 }
 
 // CreateListener invokes dbdaemon.CreateListener.
@@ -348,13 +346,17 @@ func (s *ConfigServer) CreateDatabase(ctx context.Context, req *pb.CreateDatabas
 		fmt.Sprintf("%s/%s", pdbDir, consts.DpdumpDir.Linux),
 		fmt.Sprintf("%s/rman", consts.OracleBase),
 	}
+
+	var dirs []*dbdpb.CreateDirsRequest_DirInfo
 	for _, d := range toCreate {
-		if _, err := client.CreateDir(ctx, &dbdpb.CreateDirRequest{
+		dirs = append(dirs, &dbdpb.CreateDirsRequest_DirInfo{
 			Path: d,
 			Perm: 0760,
-		}); err != nil {
-			return nil, fmt.Errorf("failed to create a PDB dir %q: %v", d, err)
-		}
+		})
+	}
+
+	if _, err := client.CreateDirs(ctx, &dbdpb.CreateDirsRequest{Dirs: dirs}); err != nil {
+		return nil, fmt.Errorf("failed to create PDB dirs: %v", err)
 	}
 
 	pdbCmd := []string{sql.QueryCreatePDB(p.pluggableDatabaseName, pdbAdmin, p.pluggableAdminPasswd, p.dataFilesDir, p.defaultTablespace, p.defaultTablespaceDatafile, p.fileConvertFrom, p.fileConvertTo)}
@@ -555,32 +557,6 @@ func (s *ConfigServer) GetOperation(ctx context.Context, req *lropb.GetOperation
 	return client.GetOperation(ctx, req)
 }
 
-// ListOperations lists all lro.
-func (s *ConfigServer) ListOperations(ctx context.Context, req *lropb.ListOperationsRequest) (*lropb.ListOperationsResponse, error) {
-	klog.InfoS("configagent/ListOperations", "req", req)
-	client, closeConn, err := newDBDClient(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/ListOperations: failed to create database daemon client: %v", err)
-	}
-	defer func() { _ = closeConn() }()
-	klog.InfoS("configagent/ListOperations", "client", client)
-
-	return client.ListOperations(ctx, req)
-}
-
-// DeleteOperation deletes lro given by name.
-func (s *ConfigServer) DeleteOperation(ctx context.Context, req *lropb.DeleteOperationRequest) (*empty.Empty, error) {
-	klog.InfoS("configagent/DeleteOperation", "req", req)
-	client, closeConn, err := newDBDClient(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/DeleteOperation: failed to create database daemon client: %v", err)
-	}
-	defer func() { _ = closeConn() }()
-	klog.InfoS("configagent/DeleteOperation", "client", client)
-
-	return client.DeleteOperation(ctx, req)
-}
-
 // CreateCDBUser creates CDB user as requested.
 func (s *ConfigServer) CreateCDBUser(ctx context.Context, req *pb.CreateCDBUserRequest) (*pb.CreateCDBUserResponse, error) {
 	klog.InfoS("configagent/CreateCDBUser", "req", req)
@@ -723,13 +699,17 @@ func (s *ConfigServer) BootstrapDatabase(ctx context.Context, req *pb.BootstrapD
 			return nil, fmt.Errorf("configagent/BootstrapDatabase: failed to bootstrap database : %v", err)
 		}
 	case pb.BootstrapDatabaseRequest_ProvisionSeeded:
-		if _, err = dbdClient.BootstrapDatabase(ctx, &dbdpb.BootstrapDatabaseRequest{
-			CdbName:  req.GetCdbName(),
-			DbDomain: req.GetDbdomain(),
-		}); err != nil {
+		lro, err := dbdClient.BootstrapDatabaseAsync(ctx, &dbdpb.BootstrapDatabaseAsyncRequest{
+			SyncRequest: &dbdpb.BootstrapDatabaseRequest{
+				CdbName:  req.GetCdbName(),
+				DbDomain: req.GetDbdomain(),
+			},
+			LroInput: &dbdpb.LROInput{OperationId: req.GetLroInput().GetOperationId()},
+		})
+		if err != nil {
 			return nil, fmt.Errorf("configagent/BootstrapDatabase: error while call dbdaemon/BootstrapDatabase: %v", err)
 		}
-		return &lropb.Operation{Done: true}, nil
+		return lro, nil
 	default:
 	}
 
@@ -810,54 +790,6 @@ func (s *ConfigServer) DataPumpExport(ctx context.Context, req *pb.DataPumpExpor
 	})
 }
 
-// SetParameter sets database parameter as requested.
-func (s *ConfigServer) SetParameter(ctx context.Context, req *pb.SetParameterRequest) (*pb.SetParameterResponse, error) {
-	klog.InfoS("configagent/SetParameter", "req", req)
-	client, closeConn, err := newDBDClient(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/SetParameter: failed to create dbdClient: %v", err)
-	}
-	defer closeConn()
-	klog.InfoS("configagent/SetParameter", "client", client)
-
-	// Fetch parameter type
-	// The possible values are IMMEDIATE FALSE DEFERRED
-	query := fmt.Sprintf("select issys_modifiable from v$parameter where name='%s'", sql.StringParam(req.Key))
-	paramType, err := fetchAndParseSingleResultQuery(ctx, client, query)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/SetParameter: error while inferring parameter type: %v", err)
-	}
-	query = fmt.Sprintf("select type from v$parameter where name='%s'", sql.StringParam(req.Key))
-	paramDatatype, err := fetchAndParseSingleResultQuery(ctx, client, query)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/SetParameter: error while inferring parameter data type: %v", err)
-	}
-	// string parameters need to be quoted,
-	// those have type 2, see the link for the parameter types description
-	// https://docs.oracle.com/database/121/REFRN/GUID-C86F3AB0-1191-447F-8EDF-4727D8693754.htm
-	isStringParam := paramDatatype == "2"
-	command, err := sql.QuerySetSystemParameterNoPanic(req.Key, req.Value, isStringParam)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/SetParameter: error constructing set parameter query: %v", err)
-	}
-
-	isStatic := false
-	if paramType == "FALSE" {
-		klog.InfoS("configagent/SetParameter", "parameter_type", "STATIC")
-		command = fmt.Sprintf("%s scope=spfile", command)
-		isStatic = true
-	}
-
-	_, err = client.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
-		Commands: []string{command},
-		Suppress: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("configagent/SetParameter: error while executing parameter command: %q", command)
-	}
-	return &pb.SetParameterResponse{Static: isStatic}, nil
-}
-
 // GetParameterTypeValue returns parameters' type and value by querying DB.
 func (s *ConfigServer) GetParameterTypeValue(ctx context.Context, req *pb.GetParameterTypeValueRequest) (*pb.GetParameterTypeValueResponse, error) {
 	klog.InfoS("configagent/GetParameterTypeValue", "req", req)
@@ -889,56 +821,6 @@ func (s *ConfigServer) GetParameterTypeValue(ctx context.Context, req *pb.GetPar
 	}
 
 	return &pb.GetParameterTypeValueResponse{Types: types, Values: values}, nil
-}
-
-// BounceDatabase shutdown/startup the database as requested.
-func (s *ConfigServer) BounceDatabase(ctx context.Context, req *pb.BounceDatabaseRequest) (*pb.BounceDatabaseResponse, error) {
-	klog.InfoS("configagent/BounceDatabase", "req", req)
-	client, closeConn, err := newDBDClient(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/BounceDatabase: failed to create dbdClient: %v", err)
-	}
-	defer closeConn()
-
-	klog.InfoS("configagent/BounceDatabase", "client", client)
-	_, err = client.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
-		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
-		DatabaseName: req.Sid,
-		Option:       "immediate",
-	})
-	if err != nil {
-		return nil, fmt.Errorf("configagent/BounceDatabase: error while shutting db: %v", err)
-	}
-	klog.InfoS("configagent/BounceDatabase: shutdown successful")
-
-	_, err = client.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
-		Operation:         dbdpb.BounceDatabaseRequest_STARTUP,
-		DatabaseName:      req.Sid,
-		AvoidConfigBackup: req.AvoidConfigBackup,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("configagent/BounceDatabase: error while starting db: %v", err)
-	}
-	klog.InfoS("configagent/BounceDatabase: startup successful")
-	return &pb.BounceDatabaseResponse{}, err
-}
-
-// RecoverConfigFile generates the binary spfile from the human readable backup pfile.
-func (s *ConfigServer) RecoverConfigFile(ctx context.Context, req *pb.RecoverConfigFileRequest) (*pb.RecoverConfigFileResponse, error) {
-	klog.InfoS("configagent/RecoverConfigFile", "req", req)
-	client, closeConn, err := newDBDClient(ctx, s)
-	if err != nil {
-		return nil, fmt.Errorf("configagent/RecoverConfigFile: failed to create dbdClient: %v", err)
-	}
-	defer closeConn()
-
-	if _, err := client.RecoverConfigFile(ctx, &dbdpb.RecoverConfigFileRequest{CdbName: req.CdbName}); err != nil {
-		klog.InfoS("configagent/RecoverConfigFile: error while recovering config file: err", "err", err)
-		return nil, fmt.Errorf("configagent/RecoverConfigFile: failed to recover config file due to: %v", err)
-	}
-	klog.InfoS("configagent/RecoverConfigFile: config file backup successful")
-
-	return &pb.RecoverConfigFileResponse{}, err
 }
 
 // fetchAndParseSingleResultQuery is a utility method intended for running single result queries.
@@ -993,20 +875,6 @@ func buildPDB(cdbName, pdbName, pdbAdminPass, version string, listeners map[stri
 		hostName:                  host,
 		skipUserCheck:             skipUserCheck,
 	}, nil
-}
-
-// FetchServiceImageMetaData fetches the image metadata from the service image.
-func (s *ConfigServer) FetchServiceImageMetaData(ctx context.Context, req *pb.FetchServiceImageMetaDataRequest) (*pb.FetchServiceImageMetaDataResponse, error) {
-	dbdClient, closeConn, err := newDBDClient(ctx, s)
-	defer func() { _ = closeConn() }()
-	if err != nil {
-		return nil, fmt.Errorf("configagent/FetchServiceImageMetaData: failed to create database daemon client: %w", err)
-	}
-	metaData, err := dbdClient.FetchServiceImageMetaData(ctx, &dbdpb.FetchServiceImageMetaDataRequest{})
-	if err != nil {
-		return &pb.FetchServiceImageMetaDataResponse{}, nil
-	}
-	return &pb.FetchServiceImageMetaDataResponse{Version: metaData.Version, CdbName: metaData.CdbName, OracleHome: metaData.OracleHome}, nil
 }
 
 // AccessSecretVersionFunc accesses the payload for the given secret version if one

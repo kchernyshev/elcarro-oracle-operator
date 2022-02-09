@@ -15,10 +15,24 @@
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 )
+
+// This is the contract. This Backup is Anthos DB Operator compliant.
+var _ commonv1alpha1.Backup = &Backup{}
+
+// BackpSpec defines the common specifications for a Backup.
+func (i *Backup) BackupSpec() *commonv1alpha1.BackupSpec {
+	return &i.Spec.BackupSpec
+}
+
+// BackupScheduleStatus defines the common status for a BackupSchedule.
+func (i *Backup) BackupStatus() *commonv1alpha1.BackupStatus {
+	return &i.Status.BackupStatus
+}
 
 // BackupSpec defines the desired state of Backup.
 type BackupSpec struct {
@@ -82,10 +96,10 @@ type BackupSpec struct {
 	// +optional
 	Filesperset int32 `json:"filesperset,omitempty"`
 
-	// For a Physical backup, optionally specify a section size in MB.
-	// Don't include the unit (MB), just the integer.
+	// For a Physical backup, optionally specify a section size in various
+	// units (K M G).
 	// +optional
-	SectionSize int32 `json:"sectionSize,omitempty"`
+	SectionSize resource.Quantity `json:"sectionSize,omitempty"`
 
 	// For a Physical backup, optionally specify the time threshold.
 	// If a threshold is reached, the backup request would time out and
@@ -167,4 +181,14 @@ type BackupList struct {
 
 func init() {
 	SchemeBuilder.Register(&Backup{}, &BackupList{})
+}
+
+func (backup *Backup) SectionSize() int32 {
+	sectionSize64, ok := backup.Spec.SectionSize.AsInt64()
+	if !ok {
+		sectionSize64 = backup.Spec.SectionSize.AsDec().UnscaledBig().Int64()
+	}
+	sectionSize32 := int32(sectionSize64)
+
+	return sectionSize32
 }

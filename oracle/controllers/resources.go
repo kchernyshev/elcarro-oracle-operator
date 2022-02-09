@@ -17,7 +17,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
@@ -33,23 +32,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 )
 
 const (
-	platformGCP                            = "GCP"
-	platformBareMetal                      = "BareMetal"
-	platformMinikube                       = "Minikube"
-	platformKind                           = "Kind"
-	defaultStorageClassNameGCP             = "csi-gce-pd"
-	defaultVolumeSnapshotClassNameGCP      = "csi-gce-pd-snapshot-class"
-	defaultStorageClassNameBM              = "csi-trident"
-	defaultVolumeSnapshotClassNameBM       = "csi-trident-snapshot-class"
-	defaultStorageClassNameMinikube        = "csi-hostpath-sc"
-	defaultVolumeSnapshotClassNameMinikube = "csi-hostpath-snapclass"
-
 	configAgentName = "config-agent"
 	// OperatorName is the default operator name.
 	OperatorName                = "operator"
@@ -60,11 +49,10 @@ const (
 )
 
 var (
-	sourceCidrRanges = []string{"0.0.0.0/0"}
-	defaultDiskSize  = resource.MustParse("100Gi")
-	dialTimeout      = 3 * time.Minute
-	configList       = []string{configAgentName, OperatorName}
-	defaultDisks     = []commonv1alpha1.DiskSpec{
+	defaultDiskSize = resource.MustParse("100Gi")
+	dialTimeout     = 3 * time.Minute
+	configList      = []string{configAgentName, OperatorName}
+	defaultDisks    = []commonv1alpha1.DiskSpec{
 		{
 			Name: "DataDisk",
 			Size: resource.MustParse("100Gi"),
@@ -75,114 +63,6 @@ var (
 		},
 	}
 )
-
-type platformConfig struct {
-	storageClassName        string
-	volumeSnapshotClassName string
-}
-
-func getPlatformConfig(p string) (*platformConfig, error) {
-	switch p {
-	case platformGCP:
-		return &platformConfig{
-			storageClassName:        defaultStorageClassNameGCP,
-			volumeSnapshotClassName: defaultVolumeSnapshotClassNameGCP,
-		}, nil
-	case platformBareMetal:
-		return &platformConfig{
-			storageClassName:        defaultStorageClassNameBM,
-			volumeSnapshotClassName: defaultVolumeSnapshotClassNameBM,
-		}, nil
-	case platformMinikube, platformKind:
-		return &platformConfig{
-			storageClassName:        defaultStorageClassNameMinikube,
-			volumeSnapshotClassName: defaultVolumeSnapshotClassNameMinikube,
-		}, nil
-	default:
-		return nil, fmt.Errorf("the current release doesn't support deployment platform %q", p)
-	}
-}
-
-func (pc *platformConfig) finalStorageClassName(config *v1alpha1.Config) string {
-	storageClassName := pc.storageClassName
-
-	// Override if explicitly requested by the Custom/Global Config.
-	// If it's not requested in the Global Config, return "",
-	// which at this point would constitute an error.
-	// (no platform specific default and no override).
-	if config != nil {
-		storageClassName = config.Spec.StorageClass
-	}
-
-	return storageClassName
-}
-
-func (pc *platformConfig) finalVolumeSnapshotClassName(config *v1alpha1.Config) string {
-	volumeSnapshotClassName := pc.volumeSnapshotClassName
-
-	// Override if explicitly requested by the Custom/Global Config.
-	// If it's not requested in the Global Config, return "",
-	// which at this point would constitute an error.
-	// (no platform specific default and no override).
-	if config != nil {
-		volumeSnapshotClassName = config.Spec.VolumeSnapshotClass
-	}
-
-	return volumeSnapshotClassName
-}
-
-// NewSvc returns the service for the database.
-func NewSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme, lb string) (*corev1.Service, error) {
-	if len(inst.Spec.SourceCidrRanges) > 0 {
-		sourceCidrRanges = inst.Spec.SourceCidrRanges
-	}
-	var svcAnnotations map[string]string
-
-	lbType := corev1.ServiceTypeLoadBalancer
-	svcNameFull := fmt.Sprintf(SvcName, inst.Name)
-	if lb == "node" {
-		lbType = corev1.ServiceTypeNodePort
-		svcNameFull = svcNameFull + "-" + lb
-	} else {
-		networkOpts := inst.Spec.DBNetworkServiceOptions
-		if networkOpts != nil && networkOpts.GCP.LoadBalancerType == "Internal" {
-			svcAnnotations = map[string]string{
-				"cloud.google.com/load-balancer-type": "Internal",
-			}
-		}
-	}
-
-	svc := &corev1.Service{
-		TypeMeta:   metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service"},
-		ObjectMeta: metav1.ObjectMeta{Name: svcNameFull, Namespace: inst.Namespace, Annotations: svcAnnotations},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"instance": inst.Name},
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "secure-listener",
-					Protocol:   "TCP",
-					Port:       consts.SecureListenerPort,
-					TargetPort: intstr.FromInt(consts.SecureListenerPort),
-				},
-				{
-					Name:       "ssl-listener",
-					Protocol:   "TCP",
-					Port:       consts.SSLListenerPort,
-					TargetPort: intstr.FromInt(consts.SSLListenerPort),
-				},
-			},
-			Type: lbType,
-			// LoadBalancerSourceRanges: sourceCidrRanges,
-		},
-	}
-
-	// Set the Instance resource to own the Service resource.
-	if err := ctrl.SetControllerReference(inst, svc, scheme); err != nil {
-		return svc, err
-	}
-
-	return svc, nil
-}
 
 // NewDBDaemonSvc returns the service for the database daemon server.
 func NewDBDaemonSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme) (*corev1.Service, error) {
@@ -253,21 +133,6 @@ func NewAgentSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme) (*corev1.Servi
 	}
 
 	return svc, nil
-}
-
-// SvcURL returns the URL for the database service.
-func SvcURL(svc *corev1.Service, port int32) string {
-	// Unset if not present: state to reflect what's observed.
-	if len(svc.Status.LoadBalancer.Ingress) == 0 {
-		return ""
-	}
-
-	hostName := svc.Status.LoadBalancer.Ingress[0].Hostname
-	if hostName == "" {
-		hostName = svc.Status.LoadBalancer.Ingress[0].IP
-	}
-
-	return net.JoinHostPort(hostName, fmt.Sprintf("%d", port))
 }
 
 // NewConfigMap returns the config map for database env variables.
@@ -362,7 +227,7 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 
 	// Kind cluster can only use local images
 	imagePullPolicy := corev1.PullAlways
-	if agentDeployment.Config != nil && agentDeployment.Config.Spec.Platform == platformKind {
+	if agentDeployment.Config != nil && agentDeployment.Config.Spec.Platform == utils.PlatformKind {
 		imagePullPolicy = corev1.PullIfNotPresent
 	}
 
@@ -456,45 +321,21 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 	return deployment, nil
 }
 
-func findDiskSize(diskName string, sp StsParams) resource.Quantity {
-	spec, exists := defaultDiskSpecs[diskName]
-	if !exists {
-		sp.Log.Info("no default volume bind with diskName %q, returns default disk size %q", diskName, defaultDiskSize)
-		return defaultDiskSize
-	}
-
-	if sp.Disks != nil {
-		for _, d := range sp.Disks {
-			if d.Name == diskName && !d.Size.IsZero() {
-				sp.Log.Info("returns size with an instance-level requested size", "diskName", diskName, "mount", defaultDiskMountLocations[spec.Name], "requestedDiskSize", d.Size)
-				return d.Size
-			}
-		}
-	}
-
-	if sp.Config != nil {
-		for _, d := range sp.Config.Spec.Disks {
-			if d.Name == diskName && !d.Size.IsZero() {
-				sp.Log.Info("returns size with the customer provided (global preference) numbers", "mount", defaultDiskMountLocations[spec.Name], "diskName", diskName, "diskSizes", d.Size)
-				return d.Size
-			}
-		}
-	}
-	sp.Log.Info("returns size with default numbers", "diskName", diskName, "mount", defaultDiskMountLocations[spec.Name], "diskSizes", spec.Size)
-	return spec.Size
-}
-
 // NewPVCs returns PVCs.
 func NewPVCs(sp StsParams) ([]corev1.PersistentVolumeClaim, error) {
 	var pvcs []corev1.PersistentVolumeClaim
 
 	for _, diskSpec := range sp.Disks {
-		rl := corev1.ResourceList{corev1.ResourceStorage: findDiskSize(diskSpec.Name, sp)}
+		var configSpec *commonv1alpha1.ConfigSpec
+		if sp.Config != nil {
+			configSpec = &sp.Config.Spec.ConfigSpec
+		}
+		rl := corev1.ResourceList{corev1.ResourceStorage: utils.FindDiskSize(&diskSpec, configSpec, defaultDiskSpecs, defaultDiskSize)}
 		pvcName, mount := GetPVCNameAndMount(sp.Inst.Name, diskSpec.Name)
 		var pvc corev1.PersistentVolumeClaim
 
 		// Determine storage class (from disk spec or config)
-		storageClass, err := ConfigAttribute("StorageClass", diskSpec.StorageClass, sp.Config)
+		storageClass, err := utils.FindStorageClassName(&diskSpec, configSpec, utils.PlatformGCP, utils.EngineOracle)
 		if err != nil || storageClass == "" {
 			return nil, fmt.Errorf("failed to identify a storageClassName for disk %q", diskSpec.Name)
 		}
@@ -570,7 +411,7 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 
 	// Kind cluster can only use local images
 	imagePullPolicy := corev1.PullAlways
-	if sp.Config != nil && sp.Config.Spec.Platform == platformKind {
+	if sp.Config != nil && sp.Config.Spec.Platform == utils.PlatformKind {
 		imagePullPolicy = corev1.PullIfNotPresent
 	}
 
@@ -705,7 +546,7 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 
 	// for minikube/kind, the default csi-hostpath-driver mounts persistent volumes writable by root only, so explicitly
 	// change owner and permissions of mounted pvs with an init container.
-	if sp.Config != nil && (sp.Config.Spec.Platform == platformMinikube || sp.Config.Spec.Platform == platformKind) {
+	if sp.Config != nil && (sp.Config.Spec.Platform == utils.PlatformMinikube || sp.Config.Spec.Platform == utils.PlatformKind) {
 		initContainers = addHostpathInitContainer(sp, initContainers, *uid, *gid)
 	}
 
@@ -756,7 +597,7 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 func NewSnapshotInst(inst *v1alpha1.Instance, scheme *runtime.Scheme, pvcName, snapName, volumeSnapshotClassName string) (*snapv1.VolumeSnapshot, error) {
 	snap := &snapv1.VolumeSnapshot{
 		TypeMeta:   metav1.TypeMeta{APIVersion: snapv1.SchemeGroupVersion.String(), Kind: "VolumeSnapshot"},
-		ObjectMeta: metav1.ObjectMeta{Name: snapName, Namespace: inst.Namespace, Labels: map[string]string{"snap": snapName}},
+		ObjectMeta: metav1.ObjectMeta{Name: snapName, Namespace: inst.Namespace, Labels: map[string]string{"name": snapName}},
 		Spec: snapv1.VolumeSnapshotSpec{
 			Source:                  snapv1.VolumeSnapshotSource{PersistentVolumeClaimName: &pvcName},
 			VolumeSnapshotClassName: func() *string { s := string(volumeSnapshotClassName); return &s }(),
@@ -813,37 +654,6 @@ func GetDBDomain(inst *v1alpha1.Instance) string {
 	}
 
 	return inst.Spec.DBDomain
-}
-
-// ConfigAttribute attempts to detect what value to use for a requested
-// attribute. If an explicit value is requested via the Spec,
-// it's immediately returned "as is". If not, a customer global Config
-// is checked and returned if set. Failing all that a platform default
-// value is used for a requested attribute.
-func ConfigAttribute(name, explicitRequest string, config *v1alpha1.Config) (string, error) {
-	if explicitRequest != "" {
-		return explicitRequest, nil
-	}
-
-	// Assume the default platform as GCP. This can be overridden via a Config.
-	platform := platformGCP
-	if config != nil && config.Spec.Platform != "" {
-		platform = config.Spec.Platform
-	}
-
-	gc, err := getPlatformConfig(platform)
-	if err != nil {
-		return "", err
-	}
-
-	switch name {
-	case "StorageClass":
-		return gc.finalStorageClassName(config), nil
-	case "VolumeSnapshotClass":
-		return gc.finalVolumeSnapshotClassName(config), nil
-	default:
-		return "", fmt.Errorf("unknown attribute requested (presently supported: StorageClass, VolumeSnapshotClass): %q", name)
-	}
 }
 
 func addHostpathInitContainer(sp StsParams, containers []corev1.Container, uid, gid int64) []corev1.Container {

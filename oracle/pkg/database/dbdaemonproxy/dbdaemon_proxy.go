@@ -66,6 +66,7 @@ var (
 	godrorDriverConn = func(ctx context.Context, ex godror.Execer) (conn, error) {
 		return godror.DriverConn(ctx, ex)
 	}
+	makecmd = "/usr/bin/make"
 )
 
 // osUtil was defined for tests.
@@ -80,7 +81,7 @@ func (o *osUtilImpl) runCommand(bin string, params []string) error {
 	ohome := os.Getenv("ORACLE_HOME")
 	klog.InfoS("executing command with args", "cmd", bin, "params", params, "ORACLE_SID", os.Getenv("ORACLE_SID"), "ORACLE_HOME", ohome, "TNS_ADMIN", os.Getenv("TNS_ADMIN"))
 	switch bin {
-	case lsnrctl(ohome), rman(ohome), orapwd(ohome), dbca(ohome), nid(ohome):
+	case lsnrctl(ohome), rman(ohome), orapwd(ohome), dbca(ohome), nid(ohome), makecmd:
 	default:
 		return fmt.Errorf("command %q is not supported", bin)
 	}
@@ -426,6 +427,50 @@ func (s *Server) SetEnv(ctx context.Context, req *dbdpb.SetEnvRequest) (*dbdpb.S
 		return &dbdpb.SetEnvResponse{}, fmt.Errorf("Proxy/SetEnv symlink creation failed for %s: %v", defaultSpfile, err)
 	}
 	return &dbdpb.SetEnvResponse{}, nil
+}
+
+// ProxyFetchServiceImageMetaData returns metadata from the container running the oracledb container
+func (s *Server) ProxyFetchServiceImageMetaData(ctx context.Context, req *dbdpb.ProxyFetchServiceImageMetaDataRequest) (*dbdpb.ProxyFetchServiceImageMetaDataResponse, error) {
+	oracleHome, cdbName, version, err := provision.FetchMetaDataFromImage()
+
+	if err != nil {
+		klog.Error("proxy/FetchServiceImageMetaData: FAILED")
+		return nil, fmt.Errorf("could not fetch image metadata: %v", err)
+	}
+
+	var seededImage bool
+	if _, err := os.Stat(consts.SeededImageFile); err == nil {
+		seededImage = true
+	} else if _, err := os.Stat(consts.UnseededImageFile); err == nil {
+		seededImage = false
+	} else {
+		klog.Error("proxy/FetchServiceImageMetaData: FAILED")
+		return nil, fmt.Errorf("could not determine if image is seeded or not: %v", err)
+	}
+
+	return &dbdpb.ProxyFetchServiceImageMetaDataResponse{Version: version, CdbName: cdbName, OracleHome: oracleHome, SeededImage: seededImage}, nil
+}
+
+func (s *Server) SetDnfsState(ctx context.Context, req *dbdpb.SetDnfsStateRequest) (*dbdpb.SetDnfsStateResponse, error) {
+	oracleHome := os.Getenv("ORACLE_HOME")
+
+	enable := "dnfs_on"
+	if !req.Enable {
+		enable = "dnfs_off"
+	}
+	params := []string{
+		"-f",
+		fmt.Sprintf("%s/rdbms/lib/%s", oracleHome, "ins_rdbms.mk"),
+		enable,
+	}
+
+	if err := s.runCommand("/usr/bin/make", params); err != nil {
+		msg := "dbdaemon/SetDnfsState error while running dNFS turning on command"
+		klog.ErrorS(err, msg, "request", req)
+		return nil, fmt.Errorf(msg)
+	}
+
+	return &dbdpb.SetDnfsStateResponse{}, nil
 }
 
 //Sets Oracle specific environment variables and creates the .env file

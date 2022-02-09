@@ -47,7 +47,7 @@ go_library(
 
 # Read in workspace status values to configure _push targets.
 # REGISTRY = "${PROW_IMAGE_REPO}".split("/")[0]
-REGISTRY = "gcr.io"
+REGISTRY = "{PROW_IMAGE_REPO}"
 
 # PROJECT = "${PROW_IMAGE_REPO}".split("/")[1]
 PROJECT = "{PROW_PROJECT}"
@@ -62,14 +62,14 @@ container_image(
         "@distroless//image:002.tar.gz",
         "@busybox//image:000.tar.gz",  # duplicated files will be retained from the lowest layer.
     ],
-    user = "nonroot:nonroot",
+    user = "65532:65532",  # nonroot:nonroot. Container admission tools require ids to guarentee nonroot.
     visibility = ["//visibility:public"],
 )
 
 container_image(
     name = "base_image",
     base = "@distroless//image",
-    user = "nonroot:nonroot",
+    user = "65532:65532",  # nonroot:nonroot. Container admission tools require ids to guarentee nonroot.
     visibility = ["//visibility:public"],
 )
 

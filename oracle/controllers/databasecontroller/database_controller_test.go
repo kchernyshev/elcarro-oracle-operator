@@ -22,16 +22,17 @@ import (
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	appsv1 "k8s.io/api/apps/v1"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
-	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
@@ -53,16 +54,22 @@ func TestDatabaseController(t *testing.T) {
 	}
 	fakeClientFactory = &testhelpers.FakeClientFactory{}
 	// Run test suite for database reconciler.
-	testhelpers.RunReconcilerTestSuite(t, &k8sClient, &k8sManager, "Database controller", func() []testhelpers.Reconciler {
-		reconciler = &DatabaseReconciler{
-			Client:        k8sManager.GetClient(),
-			Log:           ctrl.Log.WithName("controllers").WithName("Database"),
-			Scheme:        k8sManager.GetScheme(),
-			ClientFactory: fakeClientFactory,
-			Recorder:      k8sManager.GetEventRecorderFor("database-controller"),
-		}
-		return []testhelpers.Reconciler{reconciler}
-	})
+	testhelpers.CdToRoot(t)
+	testhelpers.RunFunctionalTestSuite(t,
+		&k8sClient,
+		&k8sManager,
+		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
+		"Database controller",
+		func() []testhelpers.Reconciler {
+			reconciler = &DatabaseReconciler{
+				Client:        k8sManager.GetClient(),
+				Log:           ctrl.Log.WithName("controllers").WithName("Database"),
+				Scheme:        k8sManager.GetScheme(),
+				ClientFactory: fakeClientFactory,
+				Recorder:      k8sManager.GetEventRecorderFor("database-controller"),
+			}
+			return []testhelpers.Reconciler{reconciler}
+		})
 }
 
 var _ = Describe("Database controller", func() {
@@ -93,12 +100,13 @@ var _ = Describe("Database controller", func() {
 	// Currently we only have one create database tests, after each
 	// serves as finally resource clean-up.
 	AfterEach(func() {
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdInstance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdNs)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdPod)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdAgentSvc)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdSvc)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, createdDatabase)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: instanceName}, createdInstance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: podName, Namespace: Namespace}, createdPod)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcAgentName, Namespace: Namespace}, createdAgentSvc)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcName, Namespace: Namespace}, createdSvc)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: DatabaseName}, createdDatabase)
+		// Namespace objects can not be completely deleted in testenv.
+		testhelpers.K8sDeleteWithRetryNoWait(k8sClient, ctx, client.ObjectKey{Name: Namespace}, createdNs)
 	})
 
 	Context("Setup database with manager", func() {
@@ -122,10 +130,6 @@ var _ = Describe("Database controller", func() {
 				},
 			}
 			testhelpers.K8sCreateAndGet(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: instanceName}, instance, createdInstance)
-
-			var sts appsv1.StatefulSetList
-			Expect(k8sClient.List(ctx, &sts, client.InNamespace(Namespace))).Should(Succeed())
-			Expect(len(sts.Items) == 1)
 
 			By("By creating a pod")
 			pod := &v1.Pod{
@@ -197,9 +201,6 @@ var _ = Describe("Database controller", func() {
 			}
 			DbObjKey := client.ObjectKey{Namespace: Namespace, Name: DatabaseName}
 			testhelpers.K8sCreateAndGet(k8sClient, ctx, DbObjKey, database, createdDatabase)
-
-			Expect(k8sClient.List(ctx, &sts, client.InNamespace(DatabaseName))).Should(Succeed())
-			Expect(len(sts.Items) == 1)
 
 			By("By checking that the updated database succeeded")
 			var updatedDatabase v1alpha1.Database

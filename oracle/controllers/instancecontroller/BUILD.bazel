@@ -7,6 +7,7 @@ go_library(
         "instance_controller_parameters.go",
         "instance_controller_restore.go",
         "instance_controller_standby.go",
+        "utils.go",
     ],
     importpath = "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/instancecontroller",
     visibility = ["//visibility:public"],
@@ -20,6 +21,7 @@ go_library(
         "//oracle/pkg/agents/common/sql",
         "//oracle/pkg/agents/config_agent/protos",
         "//oracle/pkg/agents/consts",
+        "//oracle/pkg/agents/oracle",
         "//oracle/pkg/k8s",
         "@com_github_go_logr_logr//:logr",
         "@go_googleapis//google/longrunning:longrunning_go_proto",
@@ -29,6 +31,7 @@ go_library(
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
         "@io_k8s_apimachinery//pkg/runtime",
         "@io_k8s_apimachinery//pkg/types",
+        "@io_k8s_apimachinery//pkg/util/intstr",
         "@io_k8s_client_go//tools/record",
         "@io_k8s_sigs_controller_runtime//:controller-runtime",
         "@io_k8s_sigs_controller_runtime//pkg/client",
@@ -40,13 +43,17 @@ go_library(
 
 go_test(
     name = "instancecontroller_test",
-    srcs = ["instance_controller_test.go"],
+    srcs = [
+        "instance_controller_parameters_test.go",
+        "instance_controller_restore_test.go",
+        "instance_controller_test.go",
+    ],
     embed = [":instancecontroller"],
     deps = [
         "//common/api/v1alpha1",
         "//oracle/api/v1alpha1",
         "//oracle/controllers/testhelpers",
-        "//oracle/pkg/agents/config_agent/protos",
+        "//oracle/pkg/agents/oracle",
         "//oracle/pkg/k8s",
         "@com_github_go_logr_logr//:logr",
         "@com_github_onsi_ginkgo//:ginkgo",
@@ -55,6 +62,7 @@ go_test(
         "@io_k8s_api//core/v1:core",
         "@io_k8s_apimachinery//pkg/api/errors",
         "@io_k8s_apimachinery//pkg/apis/meta/v1:meta",
+        "@io_k8s_apimachinery//pkg/runtime",
         "@io_k8s_client_go//util/retry",
         "@io_k8s_sigs_controller_runtime//:controller-runtime",
         "@io_k8s_sigs_controller_runtime//pkg/client",
@@ -70,7 +78,10 @@ filegroup(
 
 filegroup(
     name = "all-srcs",
-    srcs = [":package-srcs"],
+    srcs = [
+        ":package-srcs",
+        "//oracle/controllers/instancecontroller/instance_lock_test:all-srcs",
+    ],
     tags = ["automanaged"],
     visibility = ["//visibility:public"],
 )

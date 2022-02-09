@@ -18,15 +18,143 @@ package utils
 import (
 	"context"
 	"fmt"
+	"net"
 
-	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 )
+
+const (
+	PlatformGCP                            = "GCP"
+	PlatformBareMetal                      = "BareMetal"
+	PlatformMinikube                       = "Minikube"
+	PlatformKind                           = "Kind"
+	EnginePostgres                         = "Postgres"
+	EngineOracle                           = "Oracle"
+	defaultStorageClassNameGCP             = "csi-gce-pd"
+	defaultVolumeSnapshotClassNameGCP      = "csi-gce-pd-snapshot-class"
+	defaultStorageClassNameBM              = "csi-trident"
+	defaultVolumeSnapshotClassNameBM       = "csi-trident-snapshot-class"
+	defaultStorageClassNameMinikube        = "csi-hostpath-sc"
+	defaultVolumeSnapshotClassNameMinikube = "csi-hostpath-snapclass"
+)
+
+type platformConfig struct {
+	storageClassName        string
+	volumeSnapshotClassName string
+}
+
+func getPlatformConfig(p string, e string) (*platformConfig, error) {
+	// for Postgres, it allows to have no platform specified
+	if p == "" && e == EnginePostgres {
+		return &platformConfig{}, nil
+	}
+
+	switch p {
+	case PlatformGCP:
+		return &platformConfig{
+			storageClassName:        defaultStorageClassNameGCP,
+			volumeSnapshotClassName: defaultVolumeSnapshotClassNameGCP,
+		}, nil
+	case PlatformBareMetal:
+		return &platformConfig{
+			storageClassName:        defaultStorageClassNameBM,
+			volumeSnapshotClassName: defaultVolumeSnapshotClassNameBM,
+		}, nil
+	case PlatformMinikube, PlatformKind:
+		return &platformConfig{
+			storageClassName:        defaultStorageClassNameMinikube,
+			volumeSnapshotClassName: defaultVolumeSnapshotClassNameMinikube,
+		}, nil
+	default:
+		return nil, fmt.Errorf("the current release doesn't support deployment platform %q", p)
+	}
+}
+
+func FindDiskSize(diskSpec *commonv1alpha1.DiskSpec, configSpec *commonv1alpha1.ConfigSpec, defaultDiskSpecs map[string]commonv1alpha1.DiskSpec, defaultDiskSize resource.Quantity) resource.Quantity {
+	spec, exists := defaultDiskSpecs[diskSpec.Name]
+	if !exists {
+		return defaultDiskSize
+	}
+
+	if !diskSpec.Size.IsZero() {
+		return diskSpec.Size
+	}
+
+	if configSpec != nil {
+		for _, d := range configSpec.Disks {
+			if d.Name == diskSpec.Name {
+				if !d.Size.IsZero() {
+					return d.Size
+				}
+				break
+			}
+		}
+	}
+
+	return spec.Size
+}
+
+func FindStorageClassName(diskSpec *commonv1alpha1.DiskSpec, configSpec *commonv1alpha1.ConfigSpec, defaultPlatform string, engineType string) (string, error) {
+	if diskSpec.StorageClass != "" {
+		return diskSpec.StorageClass, nil
+	}
+
+	if configSpec != nil {
+		for _, d := range configSpec.Disks {
+			if d.Name == diskSpec.Name {
+				if d.StorageClass != "" {
+					return d.StorageClass, nil
+				}
+				break
+			}
+		}
+
+		if configSpec.StorageClass != "" {
+			return configSpec.StorageClass, nil
+		}
+	}
+
+	platform := setPlatform(defaultPlatform, configSpec)
+	pc, err := getPlatformConfig(platform, engineType)
+	if err != nil {
+		return "", err
+	}
+	return pc.storageClassName, nil
+}
+
+func setPlatform(defaultPlatform string, configSpec *commonv1alpha1.ConfigSpec) string {
+	platform := defaultPlatform
+	if configSpec != nil && configSpec.Platform != "" {
+		platform = configSpec.Platform
+	}
+	return platform
+}
+
+func FindVolumeSnapshotClassName(volumneSnapshotClass string, configSpec *commonv1alpha1.ConfigSpec, defaultPlatform string, engineType string) (string, error) {
+	if volumneSnapshotClass != "" {
+		return volumneSnapshotClass, nil
+	}
+
+	if configSpec != nil && configSpec.VolumeSnapshotClass != "" {
+		return configSpec.VolumeSnapshotClass, nil
+	}
+
+	platform := setPlatform(defaultPlatform, configSpec)
+	pc, err := getPlatformConfig(platform, engineType)
+	if err != nil {
+		return "", err
+	}
+	return pc.volumeSnapshotClassName, nil
+}
 
 // DiskSpaceTotal is a helper function to calculate the total amount
 // of allocated space across all disks requested for an instance.
@@ -72,7 +200,7 @@ func newSnapshot(owner v1.Object, scheme *runtime.Scheme, pvcName, snapName, vol
 
 	snapshot := &snapv1.VolumeSnapshot{
 		TypeMeta:   metav1.TypeMeta{APIVersion: snapv1.SchemeGroupVersion.String(), Kind: "VolumeSnapshot"},
-		ObjectMeta: metav1.ObjectMeta{Name: snapName, Namespace: owner.GetNamespace(), Labels: map[string]string{"snap": snapName}},
+		ObjectMeta: metav1.ObjectMeta{Name: snapName, Namespace: owner.GetNamespace(), Labels: map[string]string{"name": snapName}},
 		Spec: snapv1.VolumeSnapshotSpec{
 			Source:                  snapv1.VolumeSnapshotSource{PersistentVolumeClaimName: &pvcName},
 			VolumeSnapshotClassName: func() *string { s := string(volumeSnapshotClassName); return &s }(),
@@ -85,4 +213,39 @@ func newSnapshot(owner v1.Object, scheme *runtime.Scheme, pvcName, snapName, vol
 	}
 
 	return snapshot, nil
+}
+
+// LoadBalancerAnnotations returns cloud provider specific annotations that must be attached to a LoadBalancer k8s service during creation
+func LoadBalancerAnnotations(options *commonv1alpha1.DBLoadBalancerOptions) map[string]string {
+	var annotations map[string]string
+	if options != nil {
+		if options.GCP.LoadBalancerType == "Internal" {
+			annotations = map[string]string{
+				"cloud.google.com/load-balancer-type": "Internal",
+			}
+		}
+	}
+	return annotations
+}
+
+// LoadBalancerIpAddress returns an IP address address for the Load Balancer if specified. Otherwise, the empty string is returned.
+func LoadBalancerIpAddress(options *commonv1alpha1.DBLoadBalancerOptions) string {
+	if options != nil {
+		return options.GCP.LoadBalancerIP
+	}
+	return ""
+}
+
+// LoadBalancerURL returns a URL that can be used to connect to a Load Balancer.
+func LoadBalancerURL(svc *corev1.Service, port int) string {
+	if svc == nil || len(svc.Status.LoadBalancer.Ingress) == 0 {
+		return ""
+	}
+
+	hostName := svc.Status.LoadBalancer.Ingress[0].Hostname
+	if hostName == "" {
+		hostName = svc.Status.LoadBalancer.Ingress[0].IP
+	}
+
+	return net.JoinHostPort(hostName, fmt.Sprintf("%d", port))
 }

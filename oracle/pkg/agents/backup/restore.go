@@ -203,7 +203,7 @@ func deleteFilesForRestore(ctx context.Context, dbdClient dbdpb.DatabaseDaemonCl
 func createDirsForRestore(ctx context.Context, dbdClient dbdpb.DatabaseDaemonClient, cdbName string) error {
 	toCreate := []string{
 		// adump dir
-		fmt.Sprintf(consts.OracleBase, "admin", cdbName, "adump"),
+		filepath.Join(consts.OracleBase, "admin", cdbName, "adump"),
 		// configfiles dir
 		fmt.Sprintf(consts.ConfigDir, consts.DataMount, cdbName),
 		// datafiles dir
@@ -212,13 +212,17 @@ func createDirsForRestore(ctx context.Context, dbdClient dbdpb.DatabaseDaemonCli
 		fmt.Sprintf(consts.RecoveryAreaDir, consts.LogMount, cdbName),
 	}
 
+	var dirs []*dbdpb.CreateDirsRequest_DirInfo
 	for _, d := range toCreate {
-		if _, err := dbdClient.CreateDir(ctx, &dbdpb.CreateDirRequest{
+		dirs = append(dirs, &dbdpb.CreateDirsRequest_DirInfo{
 			Path: d,
 			Perm: 0760,
-		}); err != nil {
-			return fmt.Errorf("createDirsForRestore: failed to create dir %q: %v", d, err)
-		}
+		})
+	}
+	if _, err := dbdClient.CreateDirs(ctx, &dbdpb.CreateDirsRequest{
+		Dirs: dirs,
+	}); err != nil {
+		return fmt.Errorf("createDirsForRestore: failed to create dirs %v: %v", dirs, err)
 	}
 	return nil
 }
