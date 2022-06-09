@@ -4,14 +4,12 @@ go_library(
     name = "manual_test_lib",
     srcs = [
         "test.go",
-        "test_config_agent.go",
         "test_dbdaemon.go",
     ],
     importpath = "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/scripts/manual_test",
     visibility = ["//visibility:private"],
     deps = [
         "//oracle/controllers",
-        "//oracle/pkg/agents/config_agent/protos",
         "//oracle/pkg/agents/consts",
         "//oracle/pkg/agents/oracle",
         "@io_k8s_klog_v2//:klog",

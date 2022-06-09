@@ -22,7 +22,6 @@ import (
 
 	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	"github.com/go-logr/logr"
-	"google.golang.org/grpc"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,7 +36,6 @@ import (
 	commonutils "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
@@ -47,11 +45,10 @@ var CheckStatusInstanceFunc = controllers.CheckStatusInstanceFunc
 // InstanceReconciler reconciles an Instance object.
 type InstanceReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	Images        map[string]string
-	ClientFactory controllers.ConfigAgentClientFactory
-	Recorder      record.EventRecorder
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Images   map[string]string
+	Recorder record.EventRecorder
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
 }
@@ -224,7 +221,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		return ctrl.Result{}, err
 	}
 
-	_, agentSvc, err := r.createDataplaneServices(ctx, inst, applyOpts)
+	_, _, err = r.createDataplaneServices(ctx, inst, applyOpts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -282,16 +279,9 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	}
 
 	if k8s.ConditionStatusEquals(k8s.FindCondition(inst.Status.Conditions, k8s.StandbyReady), v1.ConditionTrue) {
-		conn, err := grpc.Dial(fmt.Sprintf("%s:%d", agentSvc.Spec.ClusterIP, consts.DefaultConfigAgentPort), grpc.WithInsecure())
-		if err != nil {
-			log.Error(err, "failed to create a conn via gRPC.Dial")
-			return ctrl.Result{}, err
-		}
-		defer conn.Close()
-		caClient := capb.NewConfigAgentClient(conn)
 		// promote the standby instance, bootstrap is part of promotion.
 		r.Recorder.Eventf(&inst, corev1.EventTypeNormal, k8s.PromoteStandbyInProgress, "")
-		if err := r.bootstrapStandby(ctx, &inst, caClient, log); err != nil {
+		if err := r.bootstrapStandby(ctx, &inst, log); err != nil {
 			r.Recorder.Eventf(&inst, corev1.EventTypeWarning, k8s.PromoteStandbyFailed, fmt.Sprintf("Error promoting standby: %v", err))
 			return ctrl.Result{}, err
 		}
@@ -401,13 +391,7 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 	switch dbInstanceCond.Reason {
 	case k8s.CreatePending:
 		// Launch the CreateCDB LRO
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, inst.Namespace, inst.Name)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-		_, err = caClient.CreateCDB(ctx, &capb.CreateCDBRequest{
+		req := &controllers.CreateCDBRequest{
 			Sid:           inst.Spec.CDBName,
 			DbUniqueName:  inst.Spec.DBUniqueName,
 			DbDomain:      controllers.GetDBDomain(inst),
@@ -416,8 +400,9 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 			//DBCA expects the parameters in the following string array format
 			// ["key1=val1", "key2=val2","key3=val3"]
 			AdditionalParams: mapsToStringArray(inst.Spec.Parameters),
-			LroInput:         &capb.LROInput{OperationId: lroCreateCDBOperationID(*inst)},
-		})
+			LroInput:         &controllers.LROInput{OperationId: lroCreateCDBOperationID(*inst)},
+		}
+		_, err = controllers.CreateCDB(ctx, r, r.DatabaseClientFactory, inst.GetNamespace(), inst.GetName(), *req)
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {
 				log.Error(err, "CreateCDB failed")
@@ -447,24 +432,18 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 	case k8s.BootstrapPending:
 		// Launch the BootstrapDatabase LRO
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, inst.Namespace, inst.Name)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-		bootstrapMode := capb.BootstrapDatabaseRequest_ProvisionUnseeded
+		bootstrapMode := controllers.BootstrapDatabaseRequest_ProvisionUnseeded
 		if isImageSeeded {
-			bootstrapMode = capb.BootstrapDatabaseRequest_ProvisionSeeded
+			bootstrapMode = controllers.BootstrapDatabaseRequest_ProvisionSeeded
 		}
-
-		lro, err := caClient.BootstrapDatabase(ctx, &capb.BootstrapDatabaseRequest{
+		req := &controllers.BootstrapDatabaseRequest{
 			CdbName:      inst.Spec.CDBName,
 			DbUniqueName: inst.Spec.DBUniqueName,
 			Dbdomain:     controllers.GetDBDomain(inst),
 			Mode:         bootstrapMode,
-			LroInput:     &capb.LROInput{OperationId: lroBootstrapCDBOperationID(*inst)},
-		})
+			LroInput:     &controllers.LROInput{OperationId: lroBootstrapCDBOperationID(*inst)},
+		}
+		lro, err := controllers.BootstrapDatabase(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, *req)
 
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {
@@ -539,7 +518,7 @@ func (r *InstanceReconciler) setDnfs(ctx context.Context, inst v1alpha1.Instance
 		AvoidConfigBackup: false,
 	})
 	if err != nil {
-		return fmt.Errorf("configagent/BounceDatabase: error while starting db: %v", err)
+		return fmt.Errorf("dbClient/BounceDatabase: error while starting db: %v", err)
 	}
 
 	return nil

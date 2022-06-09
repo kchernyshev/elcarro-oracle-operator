@@ -22,7 +22,6 @@ import (
 
 	"github.com/go-logr/logr"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
-	"google.golang.org/grpc"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -30,11 +29,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 )
 
@@ -93,14 +92,7 @@ func NewDBDaemonSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme) (*corev1.Se
 
 // NewAgentSvc returns the service for the agent.
 func NewAgentSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme) (*corev1.Service, error) {
-	ports := []corev1.ServicePort{
-		{
-			Name:       configAgentName,
-			Protocol:   "TCP",
-			Port:       consts.DefaultConfigAgentPort,
-			TargetPort: intstr.FromInt(consts.DefaultConfigAgentPort),
-		},
-	}
+	var ports []corev1.ServicePort
 	for service, enabled := range inst.Spec.Services {
 		switch service {
 		case commonv1alpha1.Monitoring:
@@ -112,6 +104,9 @@ func NewAgentSvc(inst *v1alpha1.Instance, scheme *runtime.Scheme) (*corev1.Servi
 				})
 			}
 		}
+	}
+	if len(ports) == 0 {
+		return nil, nil
 	}
 	svc := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service"},
@@ -208,21 +203,9 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 	instlabels := map[string]string{"instance": agentDeployment.Inst.Name}
 	labels := map[string]string{"instance-agent": fmt.Sprintf("%s-agent", agentDeployment.Inst.Name), "deployment": agentDeployment.Name}
 
-	configAgentArgs := []string{
-		fmt.Sprintf("--port=%d", consts.DefaultConfigAgentPort),
-		fmt.Sprintf("--dbservice=%s", fmt.Sprintf(DbdaemonSvcName, agentDeployment.Inst.Name)),
-		fmt.Sprintf("--dbport=%d", consts.DefaultDBDaemonPort),
-	}
-
 	monitoringAgentArgs := []string{
 		fmt.Sprintf("--dbservice=%s", fmt.Sprintf(DbdaemonSvcName, agentDeployment.Inst.Name)),
 		fmt.Sprintf("--dbport=%d", consts.DefaultDBDaemonPort),
-	}
-
-	if len(agentDeployment.Args[configAgentName]) > 0 {
-		for _, arg := range agentDeployment.Args[configAgentName] {
-			configAgentArgs = append(configAgentArgs, arg)
-		}
 	}
 
 	// Kind cluster can only use local images
@@ -231,21 +214,8 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 		imagePullPolicy = corev1.PullIfNotPresent
 	}
 
-	containers := []corev1.Container{
-		{
-			Name:    configAgentName,
-			Image:   agentDeployment.Images["config"],
-			Command: []string{"/configagent"},
-			Args:    configAgentArgs,
-			Ports: []corev1.ContainerPort{
-				{Name: "ca-port", Protocol: "TCP", ContainerPort: consts.DefaultConfigAgentPort},
-			},
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: &agentDeployment.PrivEscalation,
-			},
-			ImagePullPolicy: imagePullPolicy,
-		},
-	}
+	var containers []corev1.Container
+
 	agentDeployment.Log.V(2).Info("enabling services: ", "services", agentDeployment.Services)
 	for _, s := range agentDeployment.Services {
 		switch s {
@@ -270,6 +240,10 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 		default:
 			agentDeployment.Log.V(2).Info("unsupported service: ", "service", s)
 		}
+	}
+
+	if len(containers) == 0 {
+		return nil, nil
 	}
 
 	podSpec := corev1.PodSpec{
@@ -318,6 +292,7 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 	if err := ctrl.SetControllerReference(agentDeployment.Inst, deployment, agentDeployment.Scheme); err != nil {
 		return deployment, err
 	}
+
 	return deployment, nil
 }
 
@@ -616,33 +591,26 @@ func NewSnapshotInst(inst *v1alpha1.Instance, scheme *runtime.Scheme, pvcName, s
 // In particular:
 //   - has provisioning finished?
 //   - is Instance up and accepting connection requests?
-var CheckStatusInstanceFunc = func(ctx context.Context, instName, cdbName, clusterIP, DBDomain string, log logr.Logger) (string, error) {
-	log.Info("resources/checkStatusInstance", "inst name", instName, "clusterIP", clusterIP)
-
-	// Establish a connection to a Config Agent.
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-
-	conn, err := grpc.Dial(fmt.Sprintf("%s:%d", clusterIP, consts.DefaultConfigAgentPort), grpc.WithInsecure())
-	if err != nil {
-		log.Error(err, "resources/checkStatusInstance: failed to create a conn via gRPC.Dial")
-		return "", err
+var CheckStatusInstanceFunc = func(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, instName, cdbName, namespace, clusterIP, DBDomain string, log logr.Logger) (string, error) {
+	if clusterIP != "" {
+		log.Info("resources/checkStatusInstance", "inst name", instName, "clusterIP", clusterIP)
+	} else {
+		log.Info("resources/checkStatusInstance", "inst name", instName)
 	}
-	defer conn.Close()
 
-	caClient := capb.NewConfigAgentClient(conn)
-	cdOut, err := caClient.CheckStatus(ctx, &capb.CheckStatusRequest{
+	checkStatusReq := &CheckStatusRequest{
 		Name:            instName,
 		CdbName:         cdbName,
-		CheckStatusType: capb.CheckStatusRequest_INSTANCE,
+		CheckStatusType: CheckStatusRequest_INSTANCE,
 		DbDomain:        DBDomain,
-	})
+	}
+	cdOut, err := CheckStatus(ctx, r, dbClientFactory, namespace, instName, *checkStatusReq)
 	if err != nil {
-		return "", fmt.Errorf("resource/checkStatusInstance: failed on CheckStatus gRPC call: %v", err)
+		return "", fmt.Errorf("resource/checkStatusInstance: failed on CheckStatus call: %v", err)
 	}
 	log.Info("resource/CheckStatusInstance: DONE with this output", "out", cdOut)
 
-	return string(cdOut.Status), nil
+	return cdOut.Status, nil
 }
 
 // GetDBDomain figures out DBDomain from DBUniqueName and DBDomain.

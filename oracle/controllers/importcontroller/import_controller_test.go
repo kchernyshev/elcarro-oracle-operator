@@ -33,16 +33,14 @@ import (
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *ImportReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
+	k8sClient  client.Client
+	k8sManager ctrl.Manager
+	reconciler *ImportReconciler
 
 	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestImportController(t *testing.T) {
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
 	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
 	testhelpers.CdToRoot(t)
 	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
@@ -50,11 +48,10 @@ func TestImportController(t *testing.T) {
 		"Import controller",
 		func() []testhelpers.Reconciler {
 			reconciler = &ImportReconciler{
-				Client:        k8sManager.GetClient(),
-				Log:           ctrl.Log.WithName("controllers").WithName("Import"),
-				Scheme:        k8sManager.GetScheme(),
-				ClientFactory: fakeClientFactory,
-				Recorder:      k8sManager.GetEventRecorderFor("import-controller"),
+				Client:   k8sManager.GetClient(),
+				Log:      ctrl.Log.WithName("controllers").WithName("Import"),
+				Scheme:   k8sManager.GetScheme(),
+				Recorder: k8sManager.GetEventRecorderFor("import-controller"),
 
 				DatabaseClientFactory: fakeDatabaseClientFactory,
 			}
@@ -74,7 +71,6 @@ var _ = Describe("Import controller", func() {
 
 	ctx := context.Background()
 
-	var fakeConfigAgentClient *testhelpers.FakeConfigAgentClient
 	var fakeDatabaseClient *testhelpers.FakeDatabaseClient
 
 	var (
@@ -120,8 +116,6 @@ var _ = Describe("Import controller", func() {
 			return k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: database.Name}, &v1alpha1.Database{})
 		}, timeout, interval).Should(Succeed())
 
-		fakeClientFactory.Reset()
-		fakeConfigAgentClient = fakeClientFactory.Caclient
 		fakeDatabaseClientFactory.Reset()
 		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 
@@ -174,8 +168,8 @@ var _ = Describe("Import controller", func() {
 			Eventually(func() (metav1.ConditionStatus, error) {
 				return getConditionStatus(ctx, importObjectKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(metav1.ConditionTrue))
-			Eventually(fakeConfigAgentClient.DataPumpImportCalledCnt, timeout, interval).Should(Equal(1))
-			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DataPumpImportAsyncCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 
 			readyCond, err := getCondition(ctx, importObjectKey, k8s.Ready)
 			Expect(err).ShouldNot(HaveOccurred())
@@ -193,8 +187,8 @@ var _ = Describe("Import controller", func() {
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, importObjectKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.ImportFailed))
-			Eventually(fakeConfigAgentClient.DataPumpImportCalledCnt, timeout, interval).Should(Equal(1))
-			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DataPumpImportAsyncCalledCnt, timeout, interval).Should(Equal(1))
+			Eventually(fakeDatabaseClient.DeleteOperationCalledCnt, timeout, interval).Should(BeNumerically(">=", 1))
 		})
 	})
 
@@ -225,7 +219,7 @@ var _ = Describe("Import controller", func() {
 
 			// give controller some time to run import if it unexpectedly is going to
 			time.Sleep(100 * time.Millisecond)
-			Expect(fakeConfigAgentClient.DataPumpImportCalledCnt()).Should(Equal(0))
+			Expect(fakeDatabaseClient.DataPumpImportAsyncCalledCnt()).Should(Equal(0))
 			Expect(getConditionReason(ctx, importObjectKey, k8s.Ready)).Should(Equal(k8s.ImportPending))
 		})
 	})

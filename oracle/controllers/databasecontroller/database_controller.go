@@ -53,10 +53,11 @@ var (
 // DatabaseReconciler reconciles a Database object
 type DatabaseReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	ClientFactory controllers.ConfigAgentClientFactory
-	Recorder      record.EventRecorder
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	DatabaseClientFactory controllers.DatabaseClientFactory
 }
 
 func (r *DatabaseReconciler) findPod(ctx context.Context, namespace, instName string) (*corev1.PodList, error) {
@@ -149,15 +150,9 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 	log.V(1).Info("a database container identified")
 
-	// svc is needed to extract the ClusterIP, which is used in all the gRPC calls.
-	svc := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: fmt.Sprintf(controllers.AgentSvcName, db.Spec.Instance), Namespace: req.NamespacedName.Namespace}, svc); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	// CDBName is specified in Instance specs
 	cdbName := inst.Spec.CDBName
-	istatus, err := CheckStatusInstanceFunc(ctx, db.Spec.Instance, cdbName, svc.Spec.ClusterIP, DBDomain, log)
+	istatus, err := CheckStatusInstanceFunc(ctx, r, r.DatabaseClientFactory, db.Spec.Instance, cdbName, inst.Namespace, "", DBDomain, log)
 	if err != nil {
 		log.Error(err, "preflight check failed", "check the database instance status", "failed")
 		return ctrl.Result{}, err
@@ -180,7 +175,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 	log.Info("preflight check: createDatabase external LB service is ready", "svcName", lbSvc.Name)
 
-	alreadyExists, err := NewDatabase(ctx, r, &db, svc.Spec.ClusterIP, DBDomain, cdbName, log)
+	alreadyExists, err := NewDatabase(ctx, r, &db, DBDomain, cdbName, log)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -193,7 +188,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 
 	if alreadyExists {
-		if err := SyncUsers(ctx, r, &db, svc.Spec.ClusterIP, cdbName, log); err != nil {
+		if err := SyncUsers(ctx, r, &db, cdbName, log); err != nil {
 			log.Error(err, "failed to sync database")
 			return ctrl.Result{}, err
 		}
@@ -201,7 +196,7 @@ func (r *DatabaseReconciler) Reconcile(_ context.Context, req ctrl.Request) (ctr
 	}
 
 	log.V(1).Info("[DEBUG] create users", "Database", db.Spec.Name, "Users/Privs", db.Spec.Users)
-	if err := NewUsers(ctx, r, &db, svc.Spec.ClusterIP, DBDomain, cdbName, log); err != nil {
+	if err := NewUsers(ctx, r, &db, DBDomain, cdbName, log); err != nil {
 		return ctrl.Result{}, err
 	}
 

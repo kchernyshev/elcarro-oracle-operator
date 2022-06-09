@@ -36,16 +36,14 @@ import (
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *BackupReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
+	k8sClient  client.Client
+	k8sManager ctrl.Manager
+	reconciler *BackupReconciler
 
 	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestBackupController(t *testing.T) {
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
 	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
 	testhelpers.CdToRoot(t)
 	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
@@ -61,7 +59,6 @@ func TestBackupController(t *testing.T) {
 				Client:              client,
 				Log:                 ctrl.Log.WithName("controllers").WithName("Backup"),
 				Scheme:              k8sManager.GetScheme(),
-				ClientFactory:       fakeClientFactory,
 				Recorder:            k8sManager.GetEventRecorderFor("backup-controller"),
 				BackupCtrl:          &RealBackupControl{Client: k8sClient},
 				OracleBackupFactory: &RealOracleBackupFactory{},
@@ -119,7 +116,6 @@ var _ = Describe("Backup controller", func() {
 			return getInstanceConditionStatus(ctx, objKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
-		fakeClientFactory.Reset()
 		fakeDatabaseClientFactory.Reset()
 	})
 
@@ -238,7 +234,7 @@ var _ = Describe("Backup controller", func() {
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupReady))
-			Expect(fakeClientFactory.Caclient.VerifyPhysicalBackupCalledCnt()).Should(BeNumerically(">=", 1))
+			Expect(fakeDatabaseClientFactory.Dbclient.GetDownloadDirectoryFromGCSCnt()).Should(BeNumerically(">=", 1))
 		})
 	})
 
@@ -250,11 +246,9 @@ var _ = Describe("Backup controller", func() {
 				statusCheckInterval = oldStatusCheckInterval
 			}()
 
-			// configure fake ConfigAgent to be in LRO mode
-			fakeConfigAgentClient := fakeClientFactory.Caclient
-			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
-
+			// configure fakeDatabaseClient to be in LRO mode
 			fakeDatabaseClient := fakeDatabaseClientFactory.Dbclient
+			fakeDatabaseClient.SetAsyncPhysicalBackup(true)
 			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusRunning)
 
 			By("By creating a RMAN type backup of the instance")
@@ -281,7 +275,7 @@ var _ = Describe("Backup controller", func() {
 			Eventually(func() (string, error) {
 				return getConditionReason(ctx, objKey, k8s.Ready)
 			}, timeout, interval).Should(Equal(k8s.BackupInProgress))
-			Expect(fakeConfigAgentClient.PhysicalBackupCalledCnt()).Should(BeNumerically(">=", 1))
+			Expect(fakeDatabaseClient.RunRMANAsyncCalledCnt()).Should(BeNumerically(">=", 1))
 
 			By("By checking that reconciler watches backup LRO status")
 			getOperationCallsCntBefore := fakeDatabaseClient.GetOperationCalledCnt()
@@ -307,10 +301,9 @@ var _ = Describe("Backup controller", func() {
 		It("Should mark unsuccessful RMAN backup as Failed", func() {
 			// configure fake ConfigAgent to be in LRO mode with a
 			// failed operation result.
-			fakeConfigAgentClient := fakeClientFactory.Caclient
-			fakeConfigAgentClient.SetAsyncPhysicalBackup(true)
-
-			fakeDatabaseClientFactory.Dbclient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
+			fakeDatabaseClient := fakeDatabaseClientFactory.Dbclient
+			fakeDatabaseClient.SetAsyncPhysicalBackup(true)
+			fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDoneWithError)
 
 			By("By creating a RMAN type backup of the instance")
 			backup := &v1alpha1.Backup{

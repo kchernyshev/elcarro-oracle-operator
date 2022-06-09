@@ -30,17 +30,15 @@ import (
 
 	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
 // ImportReconciler reconciles an Import object.
 type ImportReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	ClientFactory controllers.ConfigAgentClientFactory
-	Recorder      record.EventRecorder
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
 }
@@ -170,20 +168,14 @@ func (r *ImportReconciler) handleNotStartedImport(ctx context.Context, log logr.
 
 	// if can start, begin import
 	if dbReady {
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, req.Namespace, imp.Spec.Instance)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-
-		resp, err := caClient.DataPumpImport(ctx, &capb.DataPumpImportRequest{
+		dataPumpReq := &controllers.DataPumpImportRequest{
 			PdbName:    db.Spec.Name,
 			DbDomain:   inst.Spec.DBDomain,
 			GcsPath:    imp.Spec.GcsPath,
 			GcsLogPath: imp.Spec.GcsLogPath,
-			LroInput:   &capb.LROInput{OperationId: lroOperationID(imp)},
-		})
+			LroInput:   &controllers.LROInput{OperationId: lroOperationID(imp)},
+		}
+		resp, err := controllers.DataPumpImport(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, *dataPumpReq)
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {
 				impWrapper.setState(k8s.ImportPending, fmt.Sprintf("failed to start import: %v", err))

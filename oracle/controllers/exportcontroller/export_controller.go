@@ -31,17 +31,15 @@ import (
 
 	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
 // ExportReconciler reconciles an export object.
 type ExportReconciler struct {
 	client.Client
-	Log           logr.Logger
-	Scheme        *runtime.Scheme
-	ClientFactory controllers.ConfigAgentClientFactory
-	Recorder      record.EventRecorder
+	Log      logr.Logger
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
 }
@@ -174,23 +172,17 @@ func (r *ExportReconciler) handleNotStartedExport(ctx context.Context, log logr.
 
 	// if can start, begin export
 	if dbReady {
-		caClient, closeConn, err := r.ClientFactory.New(ctx, r, req.Namespace, exp.Spec.Instance)
-		if err != nil {
-			log.Error(err, "failed to create config agent client")
-			return ctrl.Result{}, err
-		}
-		defer closeConn()
-
-		resp, err := caClient.DataPumpExport(ctx, &capb.DataPumpExportRequest{
+		dataPumpExportReq := &controllers.DataPumpExportRequest{
 			PdbName:       db.Spec.Name,
 			DbDomain:      inst.Spec.DBDomain,
 			ObjectType:    exp.Spec.ExportObjectType,
 			Objects:       strings.Join(exp.Spec.ExportObjects, ","),
 			GcsPath:       exp.Spec.GcsPath,
 			GcsLogPath:    exp.Spec.GcsLogPath,
-			LroInput:      &capb.LROInput{OperationId: lroOperationID(exp)},
+			LroInput:      &controllers.LROInput{OperationId: lroOperationID(exp)},
 			FlashbackTime: getFlashbackTime(exp.Spec.FlashbackTime),
-		})
+		}
+		resp, err := controllers.DataPumpExport(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, *dataPumpExportReq)
 
 		if err != nil {
 			if !controllers.IsAlreadyExistsError(err) {

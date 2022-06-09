@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -38,21 +39,21 @@ import (
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *DatabaseReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
-	DatabaseName      = testhelpers.RandName("db1")
-	Namespace         = testhelpers.RandName("ns1")
+	k8sClient                 client.Client
+	k8sManager                ctrl.Manager
+	reconciler                *DatabaseReconciler
+	DatabaseName              = testhelpers.RandName("db1")
+	Namespace                 = testhelpers.RandName("ns1")
+	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestDatabaseController(t *testing.T) {
 	// Mock function returns.
 	skipLBCheckForTest = true
-	CheckStatusInstanceFunc = func(ctx context.Context, instName, cdbName, clusterIP, DBDomain string, log logr.Logger) (string, error) {
+	CheckStatusInstanceFunc = func(ctx context.Context, r client.Reader, dbClientFactory controllers.DatabaseClientFactory, instName, cdbName, namespace, clusterIP, DBDomain string, log logr.Logger) (string, error) {
 		return "Ready", nil
 	}
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
+	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
 	// Run test suite for database reconciler.
 	testhelpers.CdToRoot(t)
 	testhelpers.RunFunctionalTestSuite(t,
@@ -61,14 +62,13 @@ func TestDatabaseController(t *testing.T) {
 		[]*runtime.SchemeBuilder{&v1alpha1.SchemeBuilder.SchemeBuilder},
 		"Database controller",
 		func() []testhelpers.Reconciler {
-			reconciler = &DatabaseReconciler{
-				Client:        k8sManager.GetClient(),
-				Log:           ctrl.Log.WithName("controllers").WithName("Database"),
-				Scheme:        k8sManager.GetScheme(),
-				ClientFactory: fakeClientFactory,
-				Recorder:      k8sManager.GetEventRecorderFor("database-controller"),
-			}
-			return []testhelpers.Reconciler{reconciler}
+			return []testhelpers.Reconciler{&DatabaseReconciler{
+				Client:                k8sManager.GetClient(),
+				Log:                   ctrl.Log.WithName("controllers").WithName("Database"),
+				Scheme:                k8sManager.GetScheme(),
+				Recorder:              k8sManager.GetEventRecorderFor("database-controller"),
+				DatabaseClientFactory: fakeDatabaseClientFactory,
+			}}
 		})
 }
 

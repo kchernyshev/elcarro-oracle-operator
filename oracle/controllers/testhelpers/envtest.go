@@ -39,6 +39,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -112,13 +113,12 @@ func RunFunctionalTestSuite(
 	k8sManager *ctrl.Manager,
 	schemeBuilders []*runtime.SchemeBuilder,
 	description string,
-	controllers func() []Reconciler) {
+	controllers func() []Reconciler,
+	crdPaths ...string) {
 	// Define the test environment.
+	crdPaths = append(crdPaths, filepath.Join("config", "crd", "bases"), filepath.Join("config", "crd", "testing"))
 	testEnv := envtest.Environment{
-		CRDDirectoryPaths: []string{
-			filepath.Join("config", "crd", "bases"),
-			filepath.Join("config", "crd", "testing"),
-		},
+		CRDDirectoryPaths:        crdPaths,
 		ControlPlaneStartTimeout: 60 * time.Second, // Default 20s may not be enough for test pods.
 	}
 
@@ -177,7 +177,6 @@ func RunFunctionalTestSuite(
 var (
 	// Base image names, to be combined with PROW_IMAGE_{TAG,REPO}.
 	dbInitImage          = "oracle.db.anthosapis.com/dbinit"
-	configAgentImage     = "oracle.db.anthosapis.com/configagent"
 	loggingSidecarImage  = "oracle.db.anthosapis.com/loggingsidecar"
 	monitoringAgentImage = "oracle.db.anthosapis.com/monitoring"
 	operatorImage        = "oracle.db.anthosapis.com/operator"
@@ -431,7 +430,6 @@ func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace st
 	}
 
 	dbInitImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, dbInitImage, agentImageTag)
-	configAgentImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, configAgentImage, agentImageTag)
 	loggingSidecarImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, loggingSidecarImage, agentImageTag)
 	monitoringAgentImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, monitoringAgentImage, agentImageTag)
 	operatorImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, operatorImage, agentImageTag)
@@ -492,7 +490,6 @@ func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace st
 		"--enable-leader-election=false",
 		"--namespace=" + DPNamespace,
 		"--db_init_image_uri=" + dbInitImage,
-		"--config_image_uri=" + configAgentImage,
 		"--logging_sidecar_image_uri=" + loggingSidecarImage,
 		"--monitoring_agent_image_uri=" + monitoringAgentImage,
 	}
@@ -582,7 +579,6 @@ func getAgentLogs(ctx context.Context, config *rest.Config, namespace, instance,
 	// with the instance.
 	agentToQuery := map[string]string{
 		// NCSA Agents
-		"config-agent":      "deployment=" + instance + "-agent-deployment",
 		"oracle-monitoring": "deployment=" + instance + "-agent-deployment",
 		// CSA Agents
 		"oracledb":             "instance=" + instance,
@@ -799,6 +795,9 @@ func CreateSimpleInstance(k8sEnv K8sOperatorEnvironment, instanceName string, ve
 				},
 				Images: map[string]string{
 					"service": TestImageForVersion(version, edition, ""),
+				},
+				DBLoadBalancerOptions: &commonv1alpha1.DBLoadBalancerOptions{
+					GCP: commonv1alpha1.DBLoadBalancerOptionsGCP{LoadBalancerType: "Internal"},
 				},
 			},
 		},
@@ -1103,7 +1102,11 @@ func k8sUpdateWithRetryHelper(k8sClient client.Client,
 	Eventually(
 		func() string {
 			// Get a fresh version of the object
-			K8sGetWithRetry(k8sClient, ctx, objKey, emptyObj)
+			err := k8sClient.Get(ctx, objKey, emptyObj)
+			if apierrors.IsNotFound(err) {
+				return originalRV + "-deleted"
+			}
+			Expect(err).ToNot(HaveOccurred())
 			return emptyObj.GetResourceVersion()
 		}, RetryTimeout, RetryInterval).Should(Not(Equal(originalRV)))
 }

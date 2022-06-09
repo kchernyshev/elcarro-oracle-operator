@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package configagent
+package controllers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,7 +24,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
-	pb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 )
 
@@ -127,10 +125,10 @@ func (us *users) getUsers(names []string) ([]*user, error) {
 	return res, nil
 }
 
-func newUsers(databaseName string, userSpecs []*pb.User) *users {
+func newUsers(databaseName string, userSpecs []*User) *users {
 	nameToUser := make(map[string]*user)
 	for _, us := range userSpecs {
-		nameToUser[strings.ToUpper(us.GetName())] = newUser(databaseName, us)
+		nameToUser[strings.ToUpper(us.Name)] = newUser(databaseName, us)
 	}
 
 	return &users{
@@ -383,9 +381,9 @@ func (u *user) GetUserEnvPrivs() []string {
 	return privs
 }
 
-func newUser(databaseName string, specUser *pb.User) *user {
+func newUser(databaseName string, specUser *User) *user {
 	var privs []string
-	for _, p := range specUser.GetPrivileges() {
+	for _, p := range specUser.Privileges {
 		upperP := strings.ToUpper(p)
 		// example: GRANT SELECT ON TABLE t TO SCOTT
 		if strings.Contains(upperP, " ON ") {
@@ -394,20 +392,26 @@ func newUser(databaseName string, specUser *pb.User) *user {
 			privs = append(privs, upperP)
 		}
 	}
+	var lastVersion string
+	if specUser.PasswordGsmSecretRef != nil {
+		lastVersion = specUser.PasswordGsmSecretRef.Version
+	} else {
+		lastVersion = ""
+	}
 	user := &user{
 		databaseName: strings.ToUpper(databaseName),
-		userName:     strings.ToUpper(specUser.GetName()),
+		userName:     strings.ToUpper(specUser.Name),
 		// Used by both gsm and plaintext
 		// can be overwritten later if GSM is enabled.
-		newPassword: specUser.GetPassword(),
+		newPassword: specUser.Password,
 		// Only used for plaintext status diff.
-		curPassword: specUser.GetLastPassword(),
+		curPassword: specUser.LastPassword,
 		specPrivs:   privs,
 		// Empty version is returned if PasswordGsmSecretRef is nil.
-		gsmSecCurVer: specUser.PasswordGsmSecretRef.GetLastVersion(),
+		gsmSecCurVer: lastVersion,
 	}
 	if specUser.PasswordGsmSecretRef != nil {
-		user.gsmSecNewVer = fmt.Sprintf(gsmSecretStr, specUser.GetPasswordGsmSecretRef().GetProjectId(), specUser.GetPasswordGsmSecretRef().GetSecretId(), specUser.GetPasswordGsmSecretRef().GetVersion())
+		user.gsmSecNewVer = fmt.Sprintf(gsmSecretStr, specUser.PasswordGsmSecretRef.ProjectId, specUser.PasswordGsmSecretRef.SecretId, specUser.PasswordGsmSecretRef.Version)
 	}
 	return user
 }
@@ -438,20 +442,6 @@ func queryDB(ctx context.Context, client dbdpb.DatabaseDaemonClient, databaseNam
 		return nil, fmt.Errorf("failed to retrieve %v from %v", key, rows)
 	}
 	return userNames, nil
-}
-
-// parseSQLResponse parses the JSON result-set (returned by runSQLPlus API) and
-// returns a list of rows with column-value mapping.
-func parseSQLResponse(resp *dbdpb.RunCMDResponse) ([]map[string]string, error) {
-	var rows []map[string]string
-	for _, msg := range resp.GetMsg() {
-		row := make(map[string]string)
-		if err := json.Unmarshal([]byte(msg), &row); err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %v", msg, err)
-		}
-		rows = append(rows, row)
-	}
-	return rows, nil
 }
 
 func queryRowsByKey(rows []map[string]string, rowKey string, filter func(val string) bool) ([]string, error) {

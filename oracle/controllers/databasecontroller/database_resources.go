@@ -22,16 +22,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/integer"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	v1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	k8s "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
@@ -49,22 +47,14 @@ var (
 // If a PDB is new, just created now, NewDatabase returns bail=false.
 // If it's an existing PDB, NewDatabase returns bail=true (so that the rest
 // of the workflow, e.g. creating users step, is not attempted).
-func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, clusterIP, dbDomain, cdbName string, log logr.Logger) (bool, error) {
-	log.Info("resources/NewDatabase: new database requested", "db", db, "clusterIP", clusterIP)
+func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, dbDomain, cdbName string, log logr.Logger) (bool, error) {
 	r.Recorder.Eventf(db, corev1.EventTypeNormal, k8s.CreatingDatabase, fmt.Sprintf("Creating new database %q", db.Spec.Name))
 
 	// Establish a connection to a Config Agent.
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
-	caClient, closeConn, err := r.ClientFactory.New(ctx, r, db.Namespace, db.Spec.Instance)
-	if err != nil {
-		log.Error(err, "resources/NewDatabase: failed to create config agent client")
-		return false, err
-	}
-	defer closeConn()
-
-	req := &capb.CreateDatabaseRequest{
+	req := &controllers.CreateDatabaseRequest{
 		Name:     db.Spec.Name,
 		CdbName:  cdbName,
 		DbDomain: dbDomain,
@@ -81,7 +71,7 @@ func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Databa
 	}
 	if db.Spec.AdminPasswordGsmSecretRef != nil {
 		userVerStr = fmt.Sprintf(gsmResourceVersionString, db.Spec.AdminPasswordGsmSecretRef.ProjectId, db.Spec.AdminPasswordGsmSecretRef.SecretId, db.Spec.AdminPasswordGsmSecretRef.Version)
-		ref := &capb.GsmSecretReference{
+		ref := &controllers.GsmSecretReference{
 			ProjectId: db.Spec.AdminPasswordGsmSecretRef.ProjectId,
 			SecretId:  db.Spec.AdminPasswordGsmSecretRef.SecretId,
 			Version:   db.Spec.AdminPasswordGsmSecretRef.Version,
@@ -91,7 +81,7 @@ func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Databa
 		}
 		req.AdminPasswordGsmSecretRef = ref
 	}
-	cdOut, err := caClient.CreateDatabase(ctx, req)
+	cdOut, err := controllers.CreateDatabase(ctx, r, r.DatabaseClientFactory, db.Namespace, db.Spec.Instance, *req)
 	if err != nil {
 		return false, fmt.Errorf("resource/NewDatabase: failed on CreateDatabase gRPC call: %v", err)
 	}
@@ -99,7 +89,7 @@ func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Databa
 
 	// "AdminUserSyncCompleted" status indicates PDB existed
 	// and admin user sync completed.
-	if cdOut != nil && cdOut.Status == "AdminUserSyncCompleted" {
+	if cdOut == "AdminUserSyncCompleted" {
 		r.Recorder.Eventf(db, corev1.EventTypeWarning, k8s.DatabaseAlreadyExists, fmt.Sprintf("Database %q already exists, sync admin user performed", db.Spec.Name))
 		// Update user version status map after newly synced database admin user.
 		// The caller will update the status by r.Status().Update.
@@ -114,7 +104,7 @@ func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Databa
 	}
 
 	// Indicated underlying database exists and admin user is in sync with the config.
-	if cdOut != nil && cdOut.Status == "AlreadyExists" {
+	if cdOut == "AlreadyExists" {
 		r.Recorder.Eventf(db, corev1.EventTypeWarning, k8s.DatabaseAlreadyExists, fmt.Sprintf("Database %q already exists", db.Spec.Name))
 		return true, nil
 	}
@@ -135,10 +125,10 @@ func NewDatabase(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Databa
 }
 
 // NewUsers attempts to create a new user.
-func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, clusterIP, dbDomain, cdbName string, log logr.Logger) error {
-	log.Info("resources/NewUsers: new database users requested", "dbName", db.Spec.Name, "clusterIP", clusterIP, "requestedUsers", db.Spec.Users)
+func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, dbDomain, cdbName string, log logr.Logger) error {
+	log.Info("resources/NewUsers: new database users requested", "dbName", db.Spec.Name, "requestedUsers", db.Spec.Users)
 	var usernames, usersCmds, grantsCmds []string
-	var userSpecs []*capb.User
+	var userSpecs []*controllers.User
 	userVerMap := make(map[string]string)
 	// Copy pdb admin user version into local map to sync later.
 	if v, ok := db.Status.UserResourceVersions[pdbAdminUserName]; ok {
@@ -158,9 +148,9 @@ func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database,
 			userVerMap[u.Name] = u.Password
 		}
 		if u.GsmSecretRef != nil {
-			userSpecs = append(userSpecs, &capb.User{
+			userSpecs = append(userSpecs, &controllers.User{
 				Name: u.Name,
-				PasswordGsmSecretRef: &capb.GsmSecretReference{
+				PasswordGsmSecretRef: &controllers.GsmSecretReference{
 					ProjectId: u.GsmSecretRef.ProjectId,
 					SecretId:  u.GsmSecretRef.SecretId,
 					Version:   u.GsmSecretRef.Version,
@@ -179,14 +169,7 @@ func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database,
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 
-	caClient, closeConn, err := r.ClientFactory.New(ctx, r, db.Namespace, db.Spec.Instance)
-	if err != nil {
-		log.Error(err, "resources/NewUsers: failed to create config agent client")
-		return err
-	}
-	defer closeConn()
-
-	req := &capb.CreateUsersRequest{
+	req := &controllers.CreateUsersRequest{
 		CdbName:       cdbName,
 		PdbName:       db.Spec.Name,
 		GrantPrivsCmd: grantsCmds,
@@ -198,7 +181,7 @@ func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database,
 	if userSpecs != nil {
 		req.User = userSpecs
 	}
-	cdOut, err := caClient.CreateUsers(ctx, req)
+	cdOut, err := controllers.CreateUsers(ctx, r, r.DatabaseClientFactory, db.Namespace, db.Spec.Instance, *req)
 	if err != nil {
 		log.Error(err, "resources/NewUsers: failed on CreateUsers gRPC call")
 	}
@@ -222,23 +205,11 @@ func NewUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database,
 }
 
 // SyncUsers attempts to update PDB users.
-func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, clusterIP, cdbName string, log logr.Logger) error {
-	// Establish a connection to a Config Agent.
-	log.Info("resources/syncUsers: sync database users requested", "db", db, "clusterIP", clusterIP)
+func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database, cdbName string, log logr.Logger) error {
+	log.Info("resources/syncUsers: sync database users requested", "db", db)
 	r.Recorder.Eventf(db, corev1.EventTypeNormal, k8s.SyncingUser, fmt.Sprintf("Syncing users for database %q", db.Spec.Name))
 
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-
-	conn, err := grpc.Dial(fmt.Sprintf("%s:%d", clusterIP, consts.DefaultConfigAgentPort), grpc.WithInsecure())
-	if err != nil {
-		log.Error(err, "resources/syncUsers: failed to create a conn via gRPC.Dial")
-		return err
-	}
-	defer conn.Close()
-
-	caClient := capb.NewConfigAgentClient(conn)
-	var userSpecs []*capb.User
+	var userSpecs []*controllers.User
 	var usernames []string
 	userVerMap := make(map[string]string)
 	// Copy pdb admin user version into local map to sync later.
@@ -251,7 +222,7 @@ func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database
 		for _, specPriv := range user.Privileges {
 			privs = append(privs, string(specPriv))
 		}
-		userSpec := &capb.User{
+		userSpec := &controllers.User{
 			Name:       user.Name,
 			Privileges: privs,
 		}
@@ -267,7 +238,7 @@ func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database
 		}
 		if user.GsmSecretRef != nil {
 			userVerMap[user.Name] = fmt.Sprintf(gsmResourceVersionString, user.GsmSecretRef.ProjectId, user.GsmSecretRef.SecretId, user.GsmSecretRef.Version)
-			ref := &capb.GsmSecretReference{
+			ref := &controllers.GsmSecretReference{
 				ProjectId: user.GsmSecretRef.ProjectId,
 				SecretId:  user.GsmSecretRef.SecretId,
 				Version:   user.GsmSecretRef.Version,
@@ -279,26 +250,28 @@ func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database
 		}
 		userSpecs = append(userSpecs, userSpec)
 	}
-	resp, err := caClient.UsersChanged(ctx, &capb.UsersChangedRequest{
+	req := &controllers.UsersChangedRequest{
 		PdbName:   db.Spec.Name,
 		UserSpecs: userSpecs,
-	})
+	}
+	resp, err := controllers.UsersChanged(ctx, r, r.DatabaseClientFactory, db.GetNamespace(), db.Spec.Instance, *req)
 	if err != nil {
 		log.Error(err, "resources/syncUsers: failed on UsersChanged gRPC call")
 		return err
 	}
 
-	if resp.GetChanged() {
+	if resp.Changed {
 		db.Status.Phase = commonv1alpha1.DatabaseUpdating
 		db.Status.Conditions = k8s.Upsert(db.Status.Conditions, k8s.UserReady, v1.ConditionFalse, k8s.SyncInProgress, "")
 		if err := r.Status().Update(ctx, db); err != nil {
 			return err
 		}
 		log.Info("resources/syncUsers: update database users requested", "CDB", cdbName, "PDB", db.Spec.Name)
-		if _, err := caClient.UpdateUsers(ctx, &capb.UpdateUsersRequest{
+		req := &controllers.UpdateUsersRequest{
 			PdbName:   db.Spec.Name,
 			UserSpecs: userSpecs,
-		}); err != nil {
+		}
+		if err := controllers.UpdateUsers(ctx, r, r.DatabaseClientFactory, db.GetNamespace(), db.Spec.Instance, *req); err != nil {
 			log.Error(err, "resources/syncUsers: failed on UpdateUser gRPC call")
 			return err
 		}
@@ -313,17 +286,17 @@ func SyncUsers(ctx context.Context, r *DatabaseReconciler, db *v1alpha1.Database
 		Message: "",
 	}
 
-	if len(resp.GetSuppressed()) != 0 {
+	if len(resp.Suppressed) != 0 {
 		userReady.Status = v1.ConditionFalse
 		userReady.Reason = k8s.UserOutOfSync
 		var msg []string
-		for _, u := range resp.GetSuppressed() {
-			if u.SuppressType == capb.UsersChangedResponse_DELETE {
+		for _, u := range resp.Suppressed {
+			if u.SuppressType == controllers.UsersChangedResponse_DELETE {
 				msg = append(msg, fmt.Sprintf("User %q not defined in database spec, "+
-					"supposed to be deleted. suppressed SQL %q. Fix by deleting the user in DB or updating DB spec to include the user", u.GetUserName(), u.GetSql()))
-			} else if u.SuppressType == capb.UsersChangedResponse_CREATE {
+					"supposed to be deleted. suppressed SQL %q. Fix by deleting the user in DB or updating DB spec to include the user", u.UserName, u.Sql))
+			} else if u.SuppressType == controllers.UsersChangedResponse_CREATE {
 				msg = append(msg, fmt.Sprintf("User %q cannot be created, "+
-					"password is not provided. Fix by creating the user in DB or updating DB spec to include password", u.GetUserName()))
+					"password is not provided. Fix by creating the user in DB or updating DB spec to include password", u.UserName))
 			}
 		}
 		userReady.Message = strings.Join(msg, ".")

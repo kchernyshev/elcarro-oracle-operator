@@ -34,16 +34,14 @@ import (
 )
 
 var (
-	k8sClient         client.Client
-	k8sManager        ctrl.Manager
-	reconciler        *ExportReconciler
-	fakeClientFactory *testhelpers.FakeClientFactory
+	k8sClient  client.Client
+	k8sManager ctrl.Manager
+	reconciler *ExportReconciler
 
 	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
 )
 
 func TestExportController(t *testing.T) {
-	fakeClientFactory = &testhelpers.FakeClientFactory{}
 	fakeDatabaseClientFactory = &testhelpers.FakeDatabaseClientFactory{}
 	testhelpers.CdToRoot(t)
 	testhelpers.RunFunctionalTestSuite(t, &k8sClient, &k8sManager,
@@ -51,11 +49,10 @@ func TestExportController(t *testing.T) {
 		"Export controller",
 		func() []testhelpers.Reconciler {
 			reconciler = &ExportReconciler{
-				Client:        k8sManager.GetClient(),
-				Log:           ctrl.Log.WithName("controllers").WithName("Export"),
-				Scheme:        k8sManager.GetScheme(),
-				ClientFactory: fakeClientFactory,
-				Recorder:      k8sManager.GetEventRecorderFor("export-controller"),
+				Client:   k8sManager.GetClient(),
+				Log:      ctrl.Log.WithName("controllers").WithName("Export"),
+				Scheme:   k8sManager.GetScheme(),
+				Recorder: k8sManager.GetEventRecorderFor("export-controller"),
 
 				DatabaseClientFactory: fakeDatabaseClientFactory,
 			}
@@ -76,13 +73,12 @@ var _ = Describe("Export controller", func() {
 	)
 
 	var (
-		instance              *v1alpha1.Instance
-		database              *v1alpha1.Database
-		export                *v1alpha1.Export
-		dbObjKey              client.ObjectKey
-		objKey                client.ObjectKey
-		fakeConfigAgentClient *testhelpers.FakeConfigAgentClient
-		fakeDatabaseClient    *testhelpers.FakeDatabaseClient
+		instance           *v1alpha1.Instance
+		database           *v1alpha1.Database
+		export             *v1alpha1.Export
+		dbObjKey           client.ObjectKey
+		objKey             client.ObjectKey
+		fakeDatabaseClient *testhelpers.FakeDatabaseClient
 	)
 	ctx := context.Background()
 
@@ -128,8 +124,6 @@ var _ = Describe("Export controller", func() {
 				return k8sClient.Get(ctx, dbObjKey, createdDatabase)
 			}, timeout, interval).Should(Succeed())
 
-		fakeClientFactory.Reset()
-		fakeConfigAgentClient = fakeClientFactory.Caclient
 		fakeDatabaseClientFactory.Reset()
 		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 	})
@@ -181,7 +175,7 @@ var _ = Describe("Export controller", func() {
 			}, timeout, interval).Should(Equal(k8s.ExportPending))
 
 			By("verifying post-conditions")
-			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(0))
+			Expect(fakeDatabaseClient.DataPumpExportAsyncCalledCnt()).Should(Equal(0))
 			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
 		})
 
@@ -199,7 +193,7 @@ var _ = Describe("Export controller", func() {
 			}, timeout, interval).Should(Equal(k8s.ExportComplete))
 
 			By("verifying post-conditions")
-			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(1))
+			Expect(fakeDatabaseClient.DataPumpExportAsyncCalledCnt()).Should(Equal(1))
 			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(1))
 		})
 
@@ -217,7 +211,7 @@ var _ = Describe("Export controller", func() {
 			}, timeout, interval).Should(Equal(k8s.ExportFailed))
 
 			By("verifying post-conditions")
-			Expect(fakeConfigAgentClient.DataPumpExportCalledCnt()).Should(Equal(1))
+			Expect(fakeDatabaseClient.DataPumpExportAsyncCalledCnt()).Should(Equal(1))
 			Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(1))
 		})
 	})

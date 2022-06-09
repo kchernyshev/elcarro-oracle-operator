@@ -170,9 +170,6 @@ buildah-push-operator:
 buildah-push-dbinit:
 	bazel run //oracle/build:dbinit_push
 
-buildah-push-configagent:
-	bazel run //oracle/build:configagent_push
-
 buildah-push-dbdaemon-client:
 	bazel run //oracle/build:dbdaemonclient_push
 
@@ -183,7 +180,7 @@ buildah-push-monitoring:
 	bazel run //oracle/build:monitoring_push
 
 # Build and push everything except the db image for integration tests.
-buildah-push-all: buildah-push-operator buildah-push-dbinit buildah-push-configagent buildah-push-logging buildah-push-monitoring
+buildah-push-all: buildah-push-operator buildah-push-dbinit buildah-push-logging buildah-push-monitoring
 
 # Install CRDs into a cluster
 install: generate-config
@@ -195,7 +192,7 @@ uninstall: generate-config
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 deploy: generate-config
-	$(MAKE) buildah-push-all -j8
+	$(MAKE) buildah-push-all-containerized -j8
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${PROW_IMAGE_REPO}/${PROW_PROJECT}/oracle.db.anthosapis.com/operator:${PROW_IMAGE_TAG}
 	$(KUSTOMIZE) build config/default | kubectl apply -f -
 
@@ -284,7 +281,6 @@ prepare-release:
 	sed -i "s/operator:latest/operator:${RELEASE_NAME}/g" operator.yaml
 	echo "updating image tags for main.go..."
 	sed -i "s/dbinit:latest/dbinit:${RELEASE_NAME}/g" main.go
-	sed -i "s/configagent:latest/configagent:${RELEASE_NAME}/g" main.go
 	sed -i "s/monitoring:latest/monitoring:${RELEASE_NAME}/g" main.go
 	sed -i "s/loggingsidecar:latest/loggingsidecar:${RELEASE_NAME}/g" main.go
 

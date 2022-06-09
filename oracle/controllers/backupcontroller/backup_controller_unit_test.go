@@ -9,7 +9,6 @@ import (
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
-	capb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/config_agent/protos"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
@@ -94,7 +93,7 @@ func (f *mockOracleBackupFactory) newOracleBackup(r *BackupReconciler, backup *v
 }
 
 func TestReconcileBackupErrors(t *testing.T) {
-	reconciler, _, backupCtrl, _, _ := newTestBackupReconciler()
+	reconciler, _, backupCtrl, _ := newTestBackupReconciler()
 	backup := v1alpha1.Backup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testBackupName,
@@ -358,7 +357,7 @@ func TestReconcileBackupCreation(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			reconciler, oracleBackup, backupCtrl, _, _ := newTestBackupReconciler()
+			reconciler, oracleBackup, backupCtrl, _ := newTestBackupReconciler()
 			var gotNewStatus v1alpha1.BackupStatus
 			backupCtrl.updateStatus = func(obj client.Object) error {
 				if _, ok := obj.(*v1alpha1.Backup); ok {
@@ -528,7 +527,7 @@ func TestReconcileVerifyExist(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			reconciler, _, backupCtrl, caclient, _ := newTestBackupReconciler()
+			reconciler, _, backupCtrl, dbClient := newTestBackupReconciler()
 			var gotNewStatus v1alpha1.BackupStatus
 			backupCtrl.updateStatus = func(obj client.Object) error {
 				if _, ok := obj.(*v1alpha1.Backup); ok {
@@ -556,8 +555,12 @@ func TestReconcileVerifyExist(t *testing.T) {
 				return &inst, nil
 			}
 
-			caclient.SetMethodToResp("VerifyPhysicalBackup", &capb.VerifyPhysicalBackupResponse{ErrMsgs: tc.verifyPhysicalBackupErrMsg})
-
+			if tc.verifyPhysicalBackupErrMsg != nil && len(tc.verifyPhysicalBackupErrMsg) > 0 {
+				err := fmt.Errorf(tc.verifyPhysicalBackupErrMsg[0])
+				dbClient.SetMethodToError("DownloadDirectoryFromGCS", err)
+			} else {
+				dbClient.RemoveMethodToError("DownloadDirectoryFromGCS")
+			}
 			gotReconcileResult, _ := reconciler.reconcileVerifyExists(context.Background(), newBackupWithSpec(tc.backupSpec), reconciler.Log)
 			if diff := cmp.Diff(gotReconcileResult, tc.wantReconcileResult); diff != "" {
 				t.Errorf("reconciler.reconcileBackupCreation got unexpected reconcile result: -want +got %v", diff)
@@ -594,21 +597,18 @@ func newBackupWithStatus(status v1alpha1.BackupStatus) *v1alpha1.Backup {
 func newTestBackupReconciler() (reconciler *BackupReconciler,
 	b *mockOracleBackup,
 	c *mockBackupControl,
-	caclient *testhelpers.FakeConfigAgentClient,
 	dbClient *testhelpers.FakeDatabaseClient) {
 	b = &mockOracleBackup{}
 	c = &mockBackupControl{}
-	caclient = &testhelpers.FakeConfigAgentClient{}
 	dbClient = &testhelpers.FakeDatabaseClient{}
 
 	return &BackupReconciler{
 		Log:                 ctrl.Log.WithName("controllers").WithName("Backup"),
 		Scheme:              runtime.NewScheme(),
-		ClientFactory:       &testhelpers.FakeClientFactory{Caclient: caclient},
 		OracleBackupFactory: &mockOracleBackupFactory{mockBackup: b},
 		Recorder:            record.NewFakeRecorder(10),
 		BackupCtrl:          c,
 
 		DatabaseClientFactory: &testhelpers.FakeDatabaseClientFactory{Dbclient: dbClient},
-	}, b, c, caclient, dbClient
+	}, b, c, dbClient
 }
