@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -35,12 +36,22 @@ import (
 )
 
 const (
+	FinalizerName              = "oracle.db.anthosapis.com"
 	PhysBackupTimeLimitDefault = 60 * time.Minute
 	StatusReady                = "Ready"
 	StatusInProgress           = "InProgress"
 
 	RestoreInProgress = "Restore" + StatusInProgress
 	CreateInProgress  = "Create" + StatusInProgress
+
+	PITRLabel                   = "pitr"
+	IncarnationLabel            = "incarnation"
+	ParentIncarnationLabel      = "parent-incarnation"
+	SCNAnnotation               = "scn"
+	TimestampAnnotation         = "timestamp"
+	DatabaseImageAnnotation     = "database-image"
+	ParameterUpdateStateMachine = "ParameterUpdateStateMachine"
+	DatabaseContainerName       = "oracledb"
 )
 
 var (
@@ -61,9 +72,12 @@ var (
 	PvcMountName = "%s-pvc-%s" // inst.name-pvc-mount, e.g. mydb-pvc-u02
 	// CmName is a string template for config map names.
 	CmName = "%s-cm"
-	// DatabasePodAppLabel is the 'app' label assigned to db pod.
-	DatabasePodAppLabel = "db-op"
-	defaultDiskSpecs    = map[string]commonv1alpha1.DiskSpec{
+	// DatabaseTaskType is the value of the 'task-type' label assigned to db pod.
+	DatabaseTaskType = "oracle-db"
+	// MonitorTaskType is the value of the 'task-type' label assigned to the monitoring deployment.
+	MonitorTaskType = "monitor"
+	// DefaultDiskSpecs is the default DiskSpec settings.
+	DefaultDiskSpecs = map[string]commonv1alpha1.DiskSpec{
 		"DataDisk": {
 			Name: "DataDisk",
 			Size: resource.MustParse("100Gi"),
@@ -101,22 +115,8 @@ type StsParams struct {
 	Services       []commonv1alpha1.Service
 }
 
-// AgentDeploymentParams stores parameters for creating a agent deployment.
-type AgentDeploymentParams struct {
-	Config         *v1alpha1.Config
-	Inst           *v1alpha1.Instance
-	Scheme         *runtime.Scheme
-	Images         map[string]string
-	PrivEscalation bool
-	Name           string
-	Log            logr.Logger
-	Args           map[string][]string
-	Services       []commonv1alpha1.Service
-}
-
 type ConnCloseFunc func()
 
-//
 type GRPCDatabaseClientFactory struct {
 	dbclient *dbdpb.DatabaseDaemonClient
 }
@@ -131,7 +131,7 @@ type DatabaseClientFactory interface {
 
 // GetPVCNameAndMount returns PVC names and their corresponding mount.
 func GetPVCNameAndMount(instName, diskName string) (string, string) {
-	spec := defaultDiskSpecs[diskName]
+	spec := DefaultDiskSpecs[diskName]
 	mountLocation := defaultDiskMountLocations[spec.Name]
 	pvcName := fmt.Sprintf(PvcMountName, instName, mountLocation)
 	return pvcName, mountLocation
@@ -152,12 +152,14 @@ func (d *GRPCDatabaseClientFactory) New(ctx context.Context, r client.Reader, na
 	return dbdpb.NewDatabaseDaemonClient(conn), conn.Close, nil
 }
 
-// Contains check whether given "elem" presents in "array"
-func Contains(array []string, elem string) bool {
-	for _, v := range array {
-		if v == elem {
-			return true
+// GetBackupGcsPath resolves the actual gcs path based on backup spec.
+func GetBackupGcsPath(backup *v1alpha1.Backup) string {
+	gcsPath := backup.Spec.GcsPath
+	if backup.Spec.GcsDir != "" {
+		if !strings.HasSuffix(backup.Spec.GcsDir, "/") {
+			gcsPath = backup.Spec.GcsDir + "/"
 		}
+		gcsPath = gcsPath + backup.Name
 	}
-	return false
+	return gcsPath
 }

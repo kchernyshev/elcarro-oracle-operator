@@ -40,13 +40,17 @@ time gcloud beta container clusters create "${PROW_CLUSTER}" \
 --project="${PROW_PROJECT}" \
 --scopes "gke-default,compute-rw,cloud-platform,https://www.googleapis.com/auth/dataaccessauditlogging" \
 --enable-gcfs \
---workload-pool="${PROW_PROJECT}.svc.id.goog"
+--workload-pool="${PROW_PROJECT}.svc.id.goog" \
+--enable-ip-alias \
+--create-subnetwork name="${PROW_CLUSTER}-subnet",range=/20 \
+--cluster-ipv4-cidr /16 \
+--services-ipv4-cidr /20
+
 
 gcloud container clusters get-credentials ${PROW_CLUSTER} --zone ${PROW_CLUSTER_ZONE} --project ${PROW_PROJECT}
 kubectl config set-context gke_${PROW_PROJECT}_${PROW_CLUSTER_ZONE}_${PROW_CLUSTER}
 
-# Create the csi-gce-pd storage class and the csi-gce-pd-snapshot-class volume snapshot class
-kubectl create -f scripts/deploy/csi/gce_pd_storage_class.yaml
+# Create the csi-gce-pd-snapshot-class VolumeSnapshotClass
 kubectl create -f scripts/deploy/csi/gce_pd_volume_snapshot_class.yaml
 
 # Create service account for this k8s cluster

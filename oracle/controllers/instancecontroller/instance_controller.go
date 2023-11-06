@@ -18,18 +18,27 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
-	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
@@ -37,6 +46,7 @@ import (
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
@@ -45,12 +55,17 @@ var CheckStatusInstanceFunc = controllers.CheckStatusInstanceFunc
 // InstanceReconciler reconciles an Instance object.
 type InstanceReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Scheme   *runtime.Scheme
-	Images   map[string]string
-	Recorder record.EventRecorder
+	Log           logr.Logger
+	SchemeVal     *runtime.Scheme
+	Images        map[string]string
+	Recorder      record.EventRecorder
+	InstanceLocks *sync.Map
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
+}
+
+func (r *InstanceReconciler) Scheme() *runtime.Scheme {
+	return r.SchemeVal
 }
 
 // +kubebuilder:rbac:groups=oracle.db.anthosapis.com,resources=instances,verbs=get;list;watch;create;update;patch;delete
@@ -61,10 +76,12 @@ type InstanceReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=services,verbs=list;watch;get;patch;create
+// +kubebuilder:rbac:groups=core,resources=services,verbs=list;watch;get;patch;create;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;create;update
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // +kubebuilder:rbac:groups=oracle.db.anthosapis.com,resources=databases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=oracle.db.anthosapis.com,resources=databases/status,verbs=get;update;patch
@@ -72,14 +89,17 @@ type InstanceReconciler struct {
 
 const (
 	physicalRestore                      = "PhysicalRestore"
-	InstanceReadyTimeout                 = 20 * time.Minute
-	DatabaseInstanceReadyTimeoutSeeded   = 20 * time.Minute
+	InstanceReadyTimeout                 = 120 * time.Minute
+	DatabaseInstanceReadyTimeoutSeeded   = 30 * time.Minute
 	DatabaseInstanceReadyTimeoutUnseeded = 60 * time.Minute // 60 minutes because it can take 50+ minutes to create an unseeded CDB
 	dateFormat                           = "20060102"
+	DefaultStsPatchingTimeout            = 25 * time.Minute
+	reconcileTimeout                     = 3 * time.Minute
 )
 
-func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ ctrl.Result, respErr error) {
-	ctx := context.Background()
+func (r *InstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, respErr error) {
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
 	log := r.Log.WithValues("Instance", req.NamespacedName)
 
 	log.Info("reconciling instance")
@@ -105,14 +125,44 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		}
 	}()
 
+	instanceReadyCond := k8s.FindCondition(inst.Status.Conditions, k8s.Ready)
+
+	if IsDeleting(&inst) {
+		return r.reconcileInstanceDeletion(ctx, req, log)
+	} else if IsStopped(&inst) && !k8s.ConditionReasonEquals(instanceReadyCond, k8s.InstanceStopped) {
+		return r.reconcileInstanceStop(ctx, req, log)
+	} else if !IsStopped(&inst) && k8s.ConditionReasonEquals(instanceReadyCond, k8s.InstanceStopped) {
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.CreateInProgress, "Restarting Instance")
+	}
+
+	// Add finalizer to clean up underlying objects in case of deletion.
+	if !controllerutil.ContainsFinalizer(&inst, controllers.FinalizerName) {
+		log.Info("adding a finalizer to the Instance object.")
+		controllerutil.AddFinalizer(&inst, controllers.FinalizerName)
+		if err := r.Update(ctx, &inst); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	diskSpace, err := commonutils.DiskSpaceTotal(&inst)
 	if err != nil {
 		log.Error(err, "failed to calculate the total disk space")
 	}
 	log.Info("common instance", "total allocated disk space across all instance disks [Gi]", diskSpace/1024/1024/1024)
 
-	instanceReadyCond := k8s.FindCondition(inst.Status.Conditions, k8s.Ready)
+	instanceReadyCond = k8s.FindCondition(inst.Status.Conditions, k8s.Ready)
 	dbInstanceCond := k8s.FindCondition(inst.Status.Conditions, k8s.DatabaseInstanceReady)
+
+	if inst.Spec.Mode == commonv1alpha1.Pause {
+		if instanceReadyCond == nil || dbInstanceCond == nil || instanceReadyCond.Reason != k8s.CreateComplete {
+			log.Info("Ignoring pause mode since only instances in a stable state can be paused.")
+		} else {
+			r.InstanceLocks.Store(fmt.Sprintf("%s-%s", inst.Namespace, inst.Name), true)
+			k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.PauseMode, "Instance switched to pause mode")
+			log.Info("Instance has been set to pause for further reconciliation reset the pause mode")
+			return ctrl.Result{}, nil
+		}
+	}
 
 	var enabledServices []commonv1alpha1.Service
 	for service, enabled := range inst.Spec.Services {
@@ -121,15 +171,15 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		}
 	}
 
-	// If the instance and database is ready, we can set the instance parameters
-	if k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) &&
-		k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) && inst.Spec.Parameters != nil {
-		log.Info("instance and db is ready, setting instance parameters")
-
-		if result, err := r.setInstanceParameterStateMachine(ctx, req, inst, log); err != nil {
-			return result, err
-		}
+	// If the instance is ready and DR enabled, we can set up standby DR.
+	if k8s.ConditionReasonEquals(instanceReadyCond, k8s.StandbyDRInProgress) && isStandbyDR(&inst) {
+		return r.standbyStateMachine(ctx, &inst, log)
 	}
+
+	if result, err := r.parameterUpdateStateMachine(ctx, req, inst, log); err != nil {
+		return result, err
+	}
+
 	// If the instance and database is ready, we can set the instance parameters
 	if k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) &&
 		k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) && (inst.Spec.EnableDnfs != inst.Status.DnfsEnabled) {
@@ -162,7 +212,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 
 	applyOpts := []client.PatchOption{client.ForceOwnership, client.FieldOwner("instance-controller")}
 
-	cm, err := controllers.NewConfigMap(&inst, r.Scheme, fmt.Sprintf(controllers.CmName, inst.Name))
+	cm, err := controllers.NewConfigMap(&inst, r.Scheme(), fmt.Sprintf(controllers.CmName, inst.Name))
 	if err != nil {
 		log.Error(err, "failed to create a ConfigMap", "cm", cm)
 		return ctrl.Result{}, err
@@ -175,7 +225,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	// Create a StatefulSet if needed.
 	sp := controllers.StsParams{
 		Inst:           &inst,
-		Scheme:         r.Scheme,
+		Scheme:         r.Scheme(),
 		Namespace:      req.NamespacedName.Namespace,
 		Images:         images,
 		SvcName:        fmt.Sprintf(controllers.SvcName, inst.Name),
@@ -186,6 +236,21 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		Config:         config,
 		Log:            log,
 		Services:       enabledServices,
+	}
+
+	if IsPatchingStateMachineEntryCondition(inst.Spec.Services, inst.Status.ActiveImages, sp.Images, inst.Status.LastFailedImages, instanceReadyCond, dbInstanceCond) ||
+		inst.Status.CurrentActiveStateMachine == "PatchingStateMachine" {
+		databasePatchingTimeout := DefaultStsPatchingTimeout
+		if inst.Spec.DatabasePatchingTimeout != nil {
+			databasePatchingTimeout = inst.Spec.DatabasePatchingTimeout.Duration
+		}
+		result, err, done := r.patchingStateMachine(req, instanceReadyCond, dbInstanceCond, &inst, ctx, &sp, config, databasePatchingTimeout, log)
+		if err != nil {
+			log.Error(err, "patchingStateMachine failed")
+		}
+		if done {
+			return result, err
+		}
 	}
 
 	// If there is a Restore section in the spec the reconciliation will be handled
@@ -203,16 +268,23 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		// No error and no result - state machine is done, proceed with main reconciler
 	}
 
+	//if we return something we have to requeue
+	res, err := r.handleResize(ctx, &inst, instanceReadyCond, dbInstanceCond, sp, applyOpts, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if !res.IsZero() {
+		return res, nil
+	}
+
 	if k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) && k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) {
 		log.Info("instance has already been provisioned and ready")
-		return ctrl.Result{}, nil
+		if res, err := r.reconcileMonitoring(ctx, &inst, log, images); err != nil || res.RequeueAfter > 0 {
+			return res, err
+		}
+		return ctrl.Result{}, r.updateDatabaseIncarnationStatus(ctx, &inst, r.Log)
 	}
 
 	if result, err := r.createStatefulSet(ctx, &inst, sp, applyOpts, log); err != nil {
-		return result, err
-	}
-
-	if result, err := r.createAgentDeployment(ctx, inst, config, images, enabledServices, applyOpts, log); err != nil {
 		return result, err
 	}
 
@@ -254,10 +326,10 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		if inst.Status.URL != "" {
 			if !k8s.ConditionReasonEquals(instanceReadyCond, k8s.CreateComplete) {
 				r.Recorder.Eventf(&inst, corev1.EventTypeNormal, "InstanceReady", "Instance has been created successfully. Elapsed Time: %v", elapsed)
+				k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, "")
+				inst.Status.ActiveImages = CloneMap(sp.Images)
+				return ctrl.Result{Requeue: true}, nil
 			}
-			k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, "")
-			inst.Status.CurrentServiceImage = images["service"]
-			return ctrl.Result{}, nil
 		}
 	}
 
@@ -269,7 +341,12 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		}
 	}
 
-	// reach here, the instance should be ready.
+	if isStandbyDR(&inst) {
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.StandbyDRInProgress, "standby DR in progress")
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// When we reach here, the instance should be ready.
 	if inst.Spec.Mode == commonv1alpha1.ManuallySetUpStandby {
 		log.Info("reconciling instance for manually set up standby: DONE")
 		// the code will return here, so we can rely on defer function to update database status.
@@ -281,7 +358,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 	if k8s.ConditionStatusEquals(k8s.FindCondition(inst.Status.Conditions, k8s.StandbyReady), v1.ConditionTrue) {
 		// promote the standby instance, bootstrap is part of promotion.
 		r.Recorder.Eventf(&inst, corev1.EventTypeNormal, k8s.PromoteStandbyInProgress, "")
-		if err := r.bootstrapStandby(ctx, &inst, log); err != nil {
+		if err := r.bootstrapStandby(ctx, &inst); err != nil {
 			r.Recorder.Eventf(&inst, corev1.EventTypeWarning, k8s.PromoteStandbyFailed, fmt.Sprintf("Error promoting standby: %v", err))
 			return ctrl.Result{}, err
 		}
@@ -290,6 +367,7 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		// ensure the correctness under retry.
 		r.Recorder.Eventf(&inst, corev1.EventTypeNormal, k8s.PromoteStandbyComplete, "")
 		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, "")
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
 		k8s.InstanceUpsertCondition(&inst.Status, k8s.StandbyReady, v1.ConditionFalse, k8s.PromoteStandbyComplete, "")
 		return ctrl.Result{Requeue: true}, err
 	}
@@ -301,23 +379,16 @@ func (r *InstanceReconciler) Reconcile(_ context.Context, req ctrl.Request) (_ c
 		log.Info("list of queried databases", "dbs", dbs)
 	}
 
-	for _, newDB := range dbs.Items {
-		// check DB name against existing ones to decide whether this is a new DB
-		if !controllers.Contains(inst.Status.DatabaseNames, newDB.Spec.Name) {
-			log.Info("found a new DB", "dbName", newDB.Spec.Name)
-			inst.Status.DatabaseNames = append(inst.Status.DatabaseNames, newDB.Spec.Name)
-		} else {
-			log.V(1).Info("not a new DB, skipping the update", "dbName", newDB.Spec.Name)
-		}
-	}
-
 	log.Info("instance status", "instanceReadyCond", instanceReadyCond, "endpoint", inst.Status.Endpoint,
 		"url", inst.Status.URL, "databases", inst.Status.DatabaseNames)
 
 	log.Info("reconciling instance: DONE")
 
-	result, err := r.reconcileDatabaseInstance(ctx, &inst, r.Log)
+	result, err := r.reconcileDatabaseInstance(ctx, &inst, r.Log, images)
 	log.Info("reconciling database instance: DONE", "result", result, "err", err)
+	if err != nil {
+		return result, err
+	}
 
 	return result, nil
 }
@@ -332,21 +403,117 @@ func lroBootstrapCDBOperationID(instance v1alpha1.Instance) string {
 	return fmt.Sprintf("BootstrapCDB_%s", instance.GetUID())
 }
 
+func (r *InstanceReconciler) reconcileInstanceDeletion(ctx context.Context, req ctrl.Request, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Deleting Instance...", "InstanceName", req.NamespacedName.Name)
+
+	var inst v1alpha1.Instance
+	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if requeue, err := r.removeMonitoringDeployment(ctx, &inst, log); err != nil {
+		return ctrl.Result{}, err
+	} else if requeue {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if len(inst.Status.DatabaseNames) == 0 {
+		controllerutil.RemoveFinalizer(&inst, controllers.FinalizerName)
+		if err := r.Update(ctx, &inst); err != nil {
+			log.Error(err, "failed to remove a finalizer from an Instance", "InstanceName", inst.Name, "FinalizerName", controllers.FinalizerName)
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	for _, dbName := range inst.Status.DatabaseNames {
+		var db v1alpha1.Database
+		if err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: dbName}, &db); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		log.Info("instance deletion in progress. deleting an attached Database(PDB) first", "InstanceName", inst.Name, "DatabaseName", db.Name)
+		if err := r.Delete(ctx, &db); err != nil {
+			log.Error(err, "failed to delete database(PDB) attached to Instance", "InstanceName", inst.Name, "DatabaseName", db.Name)
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *InstanceReconciler) reconcileInstanceStop(ctx context.Context, req ctrl.Request, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Stopping Instance...", "InstanceName", req.NamespacedName.Name)
+
+	var inst v1alpha1.Instance
+	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	r.recordEventAndUpdateStatus(ctx, &inst, v1.ConditionFalse, k8s.InstanceStoppingInProgress, "Instance is being stopped", log)
+	if _, err := r.stopDBStatefulset(ctx, req, log); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.stopMonitoringDeployment(ctx, &inst, log); err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, err := r.deleteDBLoadBalancer(ctx, &inst, log); err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, err := r.deleteDBDSVC(ctx, &inst, log); err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, err := r.deleteAgentSVC(ctx, &inst, log); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	ilb := InstanceLB(inst)
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(ilb), ilb); err == nil {
+		return ctrl.Result{}, nil
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+	r.recordEventAndUpdateStatus(ctx, &inst, v1.ConditionTrue, k8s.InstanceStopped, "Instance has been stopped", log)
+
+	return ctrl.Result{Requeue: false}, nil
+
+}
+
+func (r *InstanceReconciler) shutdownDB(ctx context.Context, inst v1alpha1.Instance) error {
+	dbClient, closeConn, err := r.DatabaseClientFactory.New(ctx, r, inst.GetNamespace(), inst.Name)
+	if err != nil {
+		return err
+	}
+	defer closeConn()
+
+	_, err = dbClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
+		DatabaseName: inst.Spec.CDBName,
+		Option:       "immediate",
+	})
+	if err != nil {
+		return fmt.Errorf("BounceDatabase: error while shutting db: %v", err)
+	}
+	return nil
+}
+
 // reconcileDatabaseInstance reconciling the underlying database instance.
 // Successful state transition for seeded instance:
 // nil->BootstrapPending->BootstrapInProgress->CreateFailed/CreateComplete
 // Successful state transition for unseeded instance:
-// nil->CreatePending->CreateInProgress->BootstrapPending->BootstrapInProgress->CreateFailed/CreateComplete
+// nil->CreatePending->CreateInProgress->BootstrapPending->BootstrapInProgress->ReconcileServices->CreateFailed/CreateComplete
 // Successful state transition for instance with restoreSpec:
 // nil->RestorePending->CreateComplete
-func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (ctrl.Result, error) {
+func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger, images map[string]string) (ctrl.Result, error) {
 	instanceReadyCond := k8s.FindCondition(inst.Status.Conditions, k8s.Ready)
 	dbInstanceCond := k8s.FindCondition(inst.Status.Conditions, k8s.DatabaseInstanceReady)
 	log.Info("reconciling database instance: ", "instanceReadyCond", instanceReadyCond, "dbInstanceCond", dbInstanceCond)
 
-	// reconcile database only when instance is ready
+	// reconcile database only when instance is ready, but requeue.
 	if !k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) {
-		return ctrl.Result{}, nil
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	isImageSeeded, err := r.isImageSeeded(ctx, inst, log)
@@ -454,7 +621,7 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 			// handle synchronous version of BootstrapDatabase
 			r.Log.Info("encountered synchronous version of BootstrapDatabase")
 			r.Log.Info("BootstrapDatabase DONE")
-			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
+			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionFalse, k8s.ReconcileServices, "Services starting")
 			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 		}
 		log.Info("BootstrapDatabase started")
@@ -474,9 +641,16 @@ func (r *InstanceReconciler) reconcileDatabaseInstance(ctx context.Context, inst
 			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
 		}
 		log.Info("BootstrapDatabase done successfully")
-		k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionFalse, k8s.ReconcileServices, "Services starting")
 		// Reconcile again
 		return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
+	case k8s.ReconcileServices:
+		res, err := r.reconcileMonitoring(ctx, inst, log, images)
+		if err == nil && res.RequeueAfter == 0 {
+			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
+			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, inst)
+		}
+		return res, err
 	case k8s.RestorePending:
 		if k8s.ConditionReasonEquals(instanceReadyCond, k8s.RestoreComplete) {
 			k8s.InstanceUpsertCondition(&inst.Status, k8s.DatabaseInstanceReady, v1.ConditionTrue, k8s.CreateComplete, "")
@@ -527,6 +701,45 @@ func (r *InstanceReconciler) setDnfs(ctx context.Context, inst v1alpha1.Instance
 func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.Log.V(1).Info("SetupWithManager", "images", r.Images)
 
+	// configPredicate is used to determine if watched events should cause
+	// all instances in the namespace to be reconciled. Right now only
+	// Images in the config affect running instances and can cause Patching
+	// so we only trigger instance reconciliation on Create/Delete and
+	// Update when Images changes.
+	configPredicate := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldConfig, ok := e.ObjectOld.(*v1alpha1.Config)
+			if !ok {
+				return false
+			}
+			newConfig, ok := e.ObjectNew.(*v1alpha1.Config)
+			if !ok {
+				return false
+			}
+			return !cmp.Equal(oldConfig.Spec.Images, newConfig.Spec.Images)
+		},
+		CreateFunc:  func(e event.CreateEvent) bool { return true },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return true },
+		GenericFunc: func(e event.GenericEvent) bool { return false },
+	}
+
+	instancesForConfig := func(obj client.Object) []ctrl.Request {
+		var requests []ctrl.Request
+		var insts v1alpha1.InstanceList
+		if err := r.List(context.Background(), &insts, client.InNamespace(obj.GetNamespace())); err != nil {
+			return nil
+		}
+		for _, inst := range insts.Items {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      inst.Name,
+					Namespace: inst.Namespace,
+				}})
+		}
+		r.Log.Info("Config event triggered instance reconcile ", "requests", requests)
+		return requests
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Instance{}).
 		Owns(&corev1.Service{}).
@@ -534,7 +747,26 @@ func (r *InstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Watches(
-			&source.Kind{Type: &v1alpha1.Database{}},
-			&handler.EnqueueRequestForObject{}).
+			&source.Kind{Type: &v1alpha1.Config{}},
+			handler.EnqueueRequestsFromMapFunc(instancesForConfig),
+			builder.WithPredicates(configPredicate),
+		).
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
 		Complete(r)
+}
+
+func lroOperationID(opType string, instance *v1alpha1.Instance) string {
+	switch opType {
+	case physicalRestore:
+		return fmt.Sprintf("%s_%s_%s", opType, instance.GetUID(), instance.Status.LastRestoreTime.Format(time.RFC3339))
+	default:
+		return fmt.Sprintf("%s_%s", opType, instance.GetUID())
+	}
+}
+func IsStopped(instance *v1alpha1.Instance) bool {
+	return instance.InstanceSpec().IsStopped != nil && *instance.InstanceSpec().IsStopped == true
+}
+
+func IsDeleting(instance *v1alpha1.Instance) bool {
+	return !instance.GetDeletionTimestamp().IsZero()
 }

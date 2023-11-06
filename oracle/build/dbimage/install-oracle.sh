@@ -39,7 +39,7 @@ setup_patching() {
     if [[ "${DB_VERSION}" == "${ORACLE_12}" ]]; then
       PATCH_VERSION="31741641"
     elif [[ "${DB_VERSION}" == "${ORACLE_19}" ]]; then
-      PATCH_VERSION="32545013"
+      PATCH_VERSION="34419443"
     fi
   fi
   local patch_suffix
@@ -112,6 +112,7 @@ _fallback_opatch_file() {
   # p6880880_180000_Linux-x86-64.zip, p6880880_122010_Linux-x86-64.zip
   # for 04302020 OPATCH, their sha256sum are identical "B08320195434559D9662729C5E02ABC8436A5C602B4355CC33A673F24D9D174"
   local candidates=(
+    "p6880880_210000_Linux-x86-64.zip"
     "p6880880_200000_Linux-x86-64.zip"
     "p6880880_190000_Linux-x86-64.zip"
     "p6880880_180000_Linux-x86-64.zip"
@@ -253,6 +254,7 @@ enable_unified_auditing() {
 }
 
 create_cdb() {
+  set +x
   local syspass="$(openssl rand -base64 16 | tr -dc a-zA-Z0-9)"
   sudo -u oracle "${OHOME}/bin/dbca" \
     -silent \
@@ -272,6 +274,15 @@ create_cdb() {
     -recoveryAreaDestination /u01/app/oracle/fast_recovery_area \
     -sysPassword "${syspass}" \
     -systemPassword "${syspass}"
+  set -x
+}
+
+prep_seedpdb() {
+  # Consider switching the temp/undo to bigfile and enabling size management of
+  # these at the KRM level.
+
+  # Ensure tempfile can grow to one full datafile 32GB by default.
+  run_sql "alter session set container=pdb\$seed; alter database tempfile '/u01/app/oracle/oradata/${CDB_NAME}/pdbseed/temp01.dbf' autoextend on maxsize unlimited;"
 }
 
 set_environment() {
@@ -299,6 +310,8 @@ cleanup_post_success() {
     rm -rf "${OHOME}/install/pilot" &&
     # Support tools
     rm -rf "${OHOME}/suptools" &&
+    # Previous patches binaries
+    rm -rf "${OHOME}/.patch_storage" &&
     # Temp location
     rm -rf /tmp/* &&
     # Install files
@@ -351,6 +364,7 @@ main() {
   patch_oracle
   if [[ "${CREATE_CDB}" == true ]]; then
     create_cdb
+    prep_seedpdb
     shutdown_oracle
   fi
   chown "${USER}:${GROUP}" /etc/oratab

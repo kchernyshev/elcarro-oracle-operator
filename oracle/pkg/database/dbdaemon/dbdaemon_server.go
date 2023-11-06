@@ -29,29 +29,33 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
-	"google.golang.org/api/iterator"
-
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/godror/godror" // Register database/sql driver
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/pkg/errors"
+	"google.golang.org/api/iterator"
 	lropb "google.golang.org/genproto/googleapis/longrunning"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"k8s.io/klog/v2"
 
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common"
+	sqlq "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/pitr"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/security"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/database/lib/lro"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/database/provision"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/util"
 )
 
 const (
@@ -99,7 +103,7 @@ type Server struct {
 	dbdClientClose func() error
 	lroServer      *lro.Server
 	syncJobs       *syncJobs
-	gcsUtil        GCSUtil
+	gcsUtil        util.GCSUtil
 }
 
 // Remove pdbConnStr from String(), as that may contain the pdb user/password
@@ -314,7 +318,13 @@ func (s *Server) CreatePasswordFile(ctx context.Context, req *dbdpb.CreatePasswo
 		return nil, fmt.Errorf("missing password for req: %v", req)
 	}
 
-	passwordFile := fmt.Sprintf("%s/orapw%s", req.Dir, strings.ToUpper(req.DatabaseName))
+	if req.GetDir() != "" {
+		if err := os.MkdirAll(req.GetDir(), 0750); err != nil {
+			return nil, fmt.Errorf("failed to create dir: %v", req.GetDir())
+		}
+	}
+
+	passwordFile := fmt.Sprintf("%s/orapw%s", req.GetDir(), req.GetDatabaseName())
 
 	params := []string{fmt.Sprintf("file=%s", passwordFile)}
 	params = append(params, fmt.Sprintf("password=%s", req.SysPassword))
@@ -330,6 +340,16 @@ func (s *Server) CreatePasswordFile(ctx context.Context, req *dbdpb.CreatePasswo
 	return &dbdpb.CreatePasswordFileResponse{}, nil
 }
 
+// CreateFile creates file based on request.
+func (s *Server) CreateFile(ctx context.Context, req *dbdpb.CreateFileRequest) (*dbdpb.CreateFileResponse, error) {
+	klog.InfoS("dbdaemon/CreateFile: ", "req", req)
+
+	if err := s.osUtil.createFile(req.Path, strings.NewReader(req.Content)); err != nil {
+		return nil, fmt.Errorf("dbdaemon/CreateFile: create failed: %v", err)
+	}
+	return &dbdpb.CreateFileResponse{}, nil
+}
+
 // SetListenerRegistration is a Database Daemon method to create a static listener registration.
 func (s *Server) SetListenerRegistration(ctx context.Context, req *dbdpb.SetListenerRegistrationRequest) (*dbdpb.BounceListenerResponse, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -339,6 +359,7 @@ func (s *Server) SetListenerRegistration(ctx context.Context, req *dbdpb.SetList
 //  1. RMAN restore command
 //  2. SQL to get latest SCN
 //  3. RMAN recover command, created by applying SCN value
+//
 // to the recover statement template passed as a parameter.
 func (s *Server) physicalRestore(ctx context.Context, req *dbdpb.PhysicalRestoreRequest) (*empty.Empty, error) {
 	errorPrefix := "dbdaemon/physicalRestore: "
@@ -347,27 +368,29 @@ func (s *Server) physicalRestore(ctx context.Context, req *dbdpb.PhysicalRestore
 		return nil, fmt.Errorf(errorPrefix+"failed to restore a database: %v", err)
 	}
 
-	scnResp, err := s.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: []string{req.GetLatestRecoverableScnQuery()}})
-	if err != nil || len(scnResp.GetMsg()) < 1 {
-		return nil, fmt.Errorf(errorPrefix+"failed to query archive log SCNs, results: %v, err: %v", scnResp, err)
+	if req.GetPitrRestoreInput() != nil {
+		if err := s.stageAndCatalog(ctx, req); err != nil {
+			return nil, fmt.Errorf(errorPrefix+"failed to stage or catalog redo logs: %v", err)
+		}
 	}
 
-	row := make(map[string]string)
-	if err := json.Unmarshal([]byte(scnResp.GetMsg()[0]), &row); err != nil {
-		return nil, err
+	var recoverStmt string
+	if req.GetPitrRestoreInput() == nil {
+		scn, err := s.latestSCN(ctx, req.GetLatestRecoverableScnQuery())
+		if err != nil {
+			return nil, fmt.Errorf(errorPrefix+"failed to get the latest SCN: %v", err)
+		}
+		recoverStmt = fmt.Sprintf(req.GetRecoverStatementTemplate(), fmt.Sprintf("scn %d", scn))
+	} else if req.GetPitrRestoreInput().GetEndTime() != nil {
+		recoverStmt = fmt.Sprintf(req.GetRecoverStatementTemplate(), fmt.Sprintf(`time "to_date('%s','DD-MON-YYYY HH24:MI:SS')"`, req.GetPitrRestoreInput().GetEndTime().AsTime().Format("02-Jan-2006 15:04:05")))
+	} else if req.GetPitrRestoreInput().GetEndScn() != 0 {
+		recoverStmt = fmt.Sprintf(req.GetRecoverStatementTemplate(), fmt.Sprintf("scn %d", req.GetPitrRestoreInput().GetEndScn()))
 	}
 
-	scn, ok := row["SCN"]
-	if !ok {
-		return nil, fmt.Errorf(errorPrefix + "failed to find column SCN in the archive log query")
+	if recoverStmt == "" {
+		return nil, fmt.Errorf(errorPrefix+"failed to build recover statement from req %+v", req)
 	}
 
-	latestSCN, err := strconv.ParseInt(scn, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf(errorPrefix+"failed to parse the SCN query (%v) to find int64: %v", scn, err)
-	}
-
-	recoverStmt := fmt.Sprintf(req.GetRecoverStatementTemplate(), latestSCN)
 	klog.InfoS(errorPrefix+"final recovery request", "recoverStmt", recoverStmt)
 
 	recoverReq := &dbdpb.RunRMANRequest{Scripts: []string{recoverStmt}}
@@ -382,11 +405,85 @@ func (s *Server) physicalRestore(ctx context.Context, req *dbdpb.PhysicalRestore
 	return &empty.Empty{}, nil
 }
 
+func (s *Server) latestSCN(ctx context.Context, query string) (int64, error) {
+	scnResp, err := s.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: []string{query}})
+	if err != nil || len(scnResp.GetMsg()) < 1 {
+		return 0, fmt.Errorf("failed to query archive log SCNs, results: %v, err: %v", scnResp, err)
+	}
+
+	row := make(map[string]string)
+	if err := json.Unmarshal([]byte(scnResp.GetMsg()[0]), &row); err != nil {
+		return 0, err
+	}
+
+	scn, ok := row["SCN"]
+	if !ok {
+		return 0, fmt.Errorf("failed to find column SCN in the archive log query")
+	}
+
+	scnNum, err := strconv.ParseInt(scn, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse the SCN query (%v) to find int64: %v", scn, err)
+	}
+	return scnNum, nil
+}
+
+func (s *Server) stageAndCatalog(ctx context.Context, req *dbdpb.PhysicalRestoreRequest) error {
+	var include func(entry pitr.LogMetadataEntry) bool
+	input := req.GetPitrRestoreInput()
+	if input.GetEndTime() != nil {
+		if input.GetStartTime() == nil {
+			return fmt.Errorf("failed to find recover end time in req %+v", req)
+		}
+		include = func(entry pitr.LogMetadataEntry) bool {
+			return !(entry.NextTime.Before(input.GetStartTime().AsTime()) || entry.FirstTime.After(input.GetEndTime().AsTime()))
+		}
+	} else if input.GetEndScn() != 0 {
+		include = func(entry pitr.LogMetadataEntry) bool {
+			entryS, err := strconv.ParseInt(entry.FirstChange, 10, 64)
+			if err != nil {
+				klog.ErrorS(err, "failed to parse replicated log FirstChange scn in metadata %+v", entry)
+				return true
+			}
+
+			entryE, err := strconv.ParseInt(entry.NextChange, 10, 64)
+			if err != nil {
+				klog.ErrorS(err, "failed to parse replicated log NextChange scn in metadata %+v", entry)
+				return true
+			}
+
+			return !(entryE < input.GetStartScn() || entryS > input.GetEndScn())
+		}
+	}
+
+	if include == nil {
+		return fmt.Errorf("either start SCN or timestamp must be specified in req %+v", req)
+	}
+
+	dir := filepath.Join(consts.RMANStagingDir, "pitr")
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return fmt.Errorf("failed to create redo logs staging dir: %v", err)
+	}
+	if err := pitr.StageLogs(ctx, dir, include, input.GetLogGcsPath()); err != nil {
+		return fmt.Errorf("failed to stage redo logs: %v", err)
+	}
+	if _, err := s.RunRMAN(ctx, &dbdpb.RunRMANRequest{
+		Scripts: []string{
+			fmt.Sprintf("catalog start with '%s' noprompt;", dir),
+		},
+	}); err != nil {
+		return fmt.Errorf("failed to catalog redo logs: %v", err)
+	}
+	return nil
+}
+
 // PhysicalRestoreAsync turns physicalRestore into an async call.
 func (s *Server) PhysicalRestoreAsync(ctx context.Context, req *dbdpb.PhysicalRestoreAsyncRequest) (*lropb.Operation, error) {
 	job, err := lro.CreateAndRunLROJobWithID(ctx, req.GetLroInput().GetOperationId(), "PhysicalRestore", s.lroServer,
 		func(ctx context.Context) (proto.Message, error) {
-			return s.physicalRestore(ctx, req.SyncRequest)
+			msg, err := s.physicalRestore(ctx, req.SyncRequest)
+			klog.InfoS("Physical restore completed", "err", err)
+			return msg, err
 		})
 
 	if err != nil {
@@ -397,6 +494,30 @@ func (s *Server) PhysicalRestoreAsync(ctx context.Context, req *dbdpb.PhysicalRe
 	return &lropb.Operation{Name: job.ID(), Done: false}, nil
 }
 
+func filterParamsForMetadata(in []string) []string {
+	// These parameters are incompatible with sqlfile, so we must remove
+	// them for our metadata dump.
+	restricted := []string{
+		"TABLE_EXISTS_ACTION",
+	}
+
+	var filtered []string
+	for _, i := range in {
+		safe := true
+		for _, r := range restricted {
+			if strings.Split(i, "=")[0] == r {
+				safe = false
+				break
+			}
+		}
+		if safe {
+			filtered = append(filtered, i)
+		}
+	}
+
+	return filtered
+}
+
 // dataPumpImport runs impdp Oracle tool against existing PDB which
 // imports data from a data pump .dmp file.
 func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRequest) (*dbdpb.DataPumpImportResponse, error) {
@@ -404,6 +525,7 @@ func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRe
 	defer s.syncJobs.pdbLoadMutex.Unlock()
 
 	importFilename := "import.dmp"
+	importMetaFile := importFilename + ".meta"
 	logFilename := "import.log"
 
 	pdbPath := fmt.Sprintf(consts.PDBPathPrefix, consts.DataMount, s.databaseSid.val, strings.ToUpper(req.PdbName))
@@ -431,6 +553,34 @@ func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRe
 	if err != nil {
 		return nil, fmt.Errorf("dbdaemon/dataPumpImport: failed to alter user %s", consts.PDBLoaderUser)
 	}
+
+	// Tested with:
+	// impdp \"/ as sysdba\" sqlfile=test_meta_tables.sql dumpfile=prod_export_cmms02072022.dmp directory=REFRESH_DUMP_DIR NOLOGFILE=YES FULL=Y INCLUDE=TABLESPACE INCLUDE=TABLESPACE_QUOTA INCLUDE=USER PARALLEL=4
+	// We dont dump tables because this can be slow O(minutes), but it would be more precise if needed it can be added.
+	tsCheckParams := []string{impdpTarget}
+	tsCheckParams = append(tsCheckParams, filterParamsForMetadata(req.CommandParams)...)
+	tsCheckParams = append(tsCheckParams, fmt.Sprintf("directory=%s", consts.DpdumpDir.Oracle))
+	tsCheckParams = append(tsCheckParams, "dumpfile="+importFilename)
+	tsCheckParams = append(tsCheckParams, "sqlfile="+importMetaFile)
+	tsCheckParams = append(tsCheckParams, "nologfile=YES")
+	tsCheckParams = append(tsCheckParams, "include=TABLESPACE")
+	tsCheckParams = append(tsCheckParams, "include=USER")
+	tsCheckParams = append(tsCheckParams, "include=TABLESPACE_QUOTA")
+
+	if err := s.runCommand(impdp(s.databaseHome), tsCheckParams); err != nil {
+		// On error code 5 (EX_SUCC_ERR), process completed reached the
+		// end but data in the DMP might have been skipped (foreign
+		// schemas, already imported tables, even failed schema imports
+		// because the DMP didn't include CREATE USER statements.)
+		if !s.osUtil.isReturnCodeEqual(err, 5) {
+			return nil, fmt.Errorf("data pump import metadata gathering failed, err = %v", err)
+		}
+
+		klog.Warning("dbdaemon/dataPumpImport: metadata gathering completed with EX_SUCC_ERR")
+	}
+
+	metaFullPath := filepath.Join(dumpDir, importMetaFile)
+	s.createTablespacesFromSqlfile(ctx, metaFullPath, req.PdbName)
 
 	params := []string{impdpTarget}
 	params = append(params, req.CommandParams...)
@@ -461,6 +611,101 @@ func (s *Server) dataPumpImport(ctx context.Context, req *dbdpb.DataPumpImportRe
 	}
 
 	return &dbdpb.DataPumpImportResponse{}, nil
+}
+
+var tsRegexp = regexp.MustCompile("(DEFAULT|CREATE|UNDO|TEMPORARY) TABLESPACE \"(.*?)\"|QUOTA UNLIMITED ON \"(.*?)\"")
+
+// createTablespacesFromSqlfile scans the sqlfile looking for tablespace
+// references. It gathers these references and then ensures the tablespaces are
+// created as BIGFILE for regular tablespaces or as AUTOEXTEND single datafile
+// for temporary tablespaces.
+func (s *Server) createTablespacesFromSqlfile(ctx context.Context, metaFullPath, PDBName string) {
+	f, err := os.Open(metaFullPath)
+	if err != nil {
+		klog.Warningf("Not creating tablespaces for import. Failed to open %q: %v", metaFullPath, err)
+		return
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			klog.Warningf("failed to close import metafile %v: %v", f, err)
+		}
+	}()
+
+	// Gather a list of tablespaces required by this sqlfile.
+	ts := map[string]bool{}
+	tsTemp := map[string]bool{}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		matches := tsRegexp.FindStringSubmatch(line)
+		if len(matches) > 0 {
+			kind := matches[1]
+			name1 := matches[2]
+			name2 := matches[3]
+			if kind == "DEFAULT" || kind == "CREATE" {
+				ts[name1] = true
+			}
+			if kind == "" { // from the grant match.
+				ts[name2] = true
+			}
+			if kind == "TEMPORARY" {
+				tsTemp[name1] = true
+			}
+		}
+	}
+
+	sqlResp, err := s.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{
+		Commands: []string{
+			sqlq.QuerySetSessionContainer(PDBName),
+			"select contents, tablespace_name from dba_tablespaces",
+		},
+	})
+	if err != nil {
+		klog.Warningf("createTablespacesFromSqlfile: query tablespaces failed: %v", err)
+		return
+	}
+
+	// Check what tablespaces already exist and remove them from our list.
+	tsJSONs := sqlResp.GetMsg()
+	for _, js := range tsJSONs {
+		row := make(map[string]string)
+		if err := json.Unmarshal([]byte(js), &row); err != nil {
+			klog.Warningf("createTablespacesFromSqlfile: failed to parse pdb tablespaces response: %v", err)
+			return
+		}
+		name := row["TABLESPACE_NAME"]
+		kind := row["CONTENTS"]
+		if _, ok := ts[name]; ok && kind == "PERMANENT" {
+			delete(ts, name)
+		}
+		if _, ok := tsTemp[name]; ok && kind == "TEMPORARY" {
+			delete(tsTemp, name)
+		}
+	}
+
+	// Create any remaining tablespaces
+	for t := range ts {
+		_, err := s.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
+			Commands: []string{
+				sqlq.QuerySetSessionContainer(PDBName),
+				fmt.Sprintf("create bigfile tablespace \"%s\"", t),
+			},
+		})
+		if err != nil {
+			klog.Warningf("createTablespacesFromSqlfile: failed to create tablespace %s: %v", t, err)
+		}
+	}
+	for t := range tsTemp {
+		_, err := s.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
+			Commands: []string{
+				sqlq.QuerySetSessionContainer(PDBName),
+				fmt.Sprintf("create temporary tablespace \"%s\" size 128M autoextend on", t),
+			},
+		})
+		if err != nil {
+			klog.Warningf("createTablespacesFromSqlfile: failed to create tablespace %s: %v", t, err)
+		}
+	}
 }
 
 // DataPumpImportAsync turns dataPumpImport into an async call.
@@ -588,6 +833,121 @@ func (s *Server) DataPumpExportAsync(ctx context.Context, req *dbdpb.DataPumpExp
 	return &lropb.Operation{Name: job.ID(), Done: false}, nil
 }
 
+// Restart database in upgrade mode, apply 'datapath', restart in normal mode
+// Executes following steps:
+// SQL> shutdown immediate
+// SQL> startup nomount
+// SQL> alter database mount
+// SQL> alter database open upgrade
+// SQL> alter pluggable database all open upgrade
+// /u01/app/oracle/product/12.2/db/OPatch/datapatch -verbose
+// SQL> shutdown immediate
+// SQL> startup
+// SQL> alter pluggable database all open
+func (s *Server) applyDataPatch(ctx context.Context) (*dbdpb.ApplyDataPatchResponse, error) {
+	s.syncJobs.maintenanceMutex.Lock()
+	defer s.syncJobs.maintenanceMutex.Unlock()
+
+	klog.InfoS("dbdaemon/applyDataPatch started")
+
+	// Ask proxy to shutdown the DB
+	if _, err := s.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
+		DatabaseName: s.databaseSid.val,
+		Option:       "immediate",
+	}); err != nil {
+		return nil, fmt.Errorf("proxy request to shutdown DB failed: %w", err)
+	}
+
+	klog.InfoS("dbdaemon/applyDataPatch DB is down, starting in upgrade mode")
+
+	// Ask proxy to startup the DB in NOMOUNT mode
+	if _, err := s.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_STARTUP,
+		DatabaseName: s.databaseSid.val,
+		Option:       "nomount",
+	}); err != nil {
+		return nil, fmt.Errorf("proxy request to startup DB failed: %w", err)
+	}
+
+	// Set upgrade mode (possible OJVM upgrades still require this, but may fail some standard patches).
+	if err := s.database.setDatabaseUpgradeMode(ctx); err != nil {
+		return nil, err
+	}
+
+	klog.InfoS("dbdaemon/applyDataPatch DB is in migrate state, starting datapatch")
+
+	// oracle/product/12.2/db/OPatch/datapatch -verbose
+	dpCode := 0
+	if err := s.runCommand(datapatch(s.databaseHome), []string{"-verbose"}); err != nil {
+		if exitError, ok := err.(*exec.ExitError); !ok {
+			return nil, fmt.Errorf("datapatch failed: %w", err)
+		} else {
+			dpCode = exitError.ExitCode()
+		}
+	}
+	// We will try again in normal mode.
+	klog.InfoS("dbdaemon/applyDataPatch datapatch attempt in upgrade mode completed, restarting DB in normal mode", "return code", dpCode)
+
+	// Ask proxy to shutdown the DB
+	// SQL> shutdown immediate
+	if _, err := s.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
+		DatabaseName: s.databaseSid.val,
+		Option:       "immediate",
+	}); err != nil {
+		return nil, fmt.Errorf("proxy request to shutdown DB failed: %w", err)
+	}
+
+	// Ask proxy to startup the DB
+	// SQL> startup
+	if _, err := s.dbdClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
+		Operation:    dbdpb.BounceDatabaseRequest_STARTUP,
+		DatabaseName: s.databaseSid.val,
+		Option:       "",
+	}); err != nil {
+		return nil, fmt.Errorf("proxy request to startup DB failed: %w", err)
+	}
+
+	// SQL> alter pluggable database all open
+	if err := s.database.openPDBs(ctx); err != nil {
+		return nil, err
+	}
+	// At this point CDB$ROOT, PDB$SEED and all PDBs should be in normal 'RW' or 'RO' state
+
+	// Retry datapatch in normal mode for those that require it.
+	if err := s.runCommand(datapatch(s.databaseHome), []string{"-verbose"}); err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("datapatch failed in normal mode with exit code = %v: %w", exitError.ExitCode(), err)
+		}
+		return nil, fmt.Errorf("datapatch failed: %w", err)
+	}
+
+	klog.InfoS("dbdaemon/applyDataPatch completed, DB is back up")
+	return &dbdpb.ApplyDataPatchResponse{}, nil
+}
+
+// ApplyDataPatchAsync turns applyDataPatch into an async call.
+func (s *Server) ApplyDataPatchAsync(ctx context.Context, req *dbdpb.ApplyDataPatchAsyncRequest) (*lropb.Operation, error) {
+	job, err := lro.CreateAndRunLROJobWithID(ctx, req.GetLroInput().GetOperationId(), "ApplyDataPatch", s.lroServer,
+		func(ctx context.Context) (proto.Message, error) {
+			// Protect databaseSid
+			s.databaseSid.Lock()
+			defer s.databaseSid.Unlock()
+			resp, err := s.applyDataPatch(ctx)
+			if err != nil {
+				klog.ErrorS(err, "dbdaemon/ApplyDataPatchAsync failed")
+			}
+			return resp, err
+		})
+
+	if err != nil {
+		klog.ErrorS(err, "dbdaemon/ApplyDataPatchAsync failed to create an LRO job", "request", req)
+		return nil, err
+	}
+	return &lropb.Operation{Name: job.ID(), Done: false}, nil
+}
+
 // ListOperations returns a paged list of currently managed long running operations.
 func (s *Server) ListOperations(ctx context.Context, req *lropb.ListOperationsRequest) (*lropb.ListOperationsResponse, error) {
 	return s.lroServer.ListOperations(ctx, req)
@@ -630,25 +990,25 @@ func open(ctx context.Context, dbURL string, prelim bool) (oracleDatabase, error
 	if err == nil {
 		// Force a connection with Ping.
 		err = db.Ping()
-		if err != nil {
-			// Connection pool opened but ping failed, close this pool.
-			if err := db.Close(); err != nil {
-				klog.Warningf("failed to close db connection: %v", err)
-			}
+		if err == nil {
+			return db, nil
+		}
+		// Connection pool opened but ping failed, close this pool.
+		if errC := db.Close(); errC != nil {
+			klog.Warningf("failed to close db connection: %v", errC)
 		}
 	}
 
-	if err != nil {
+	if !prelim {
 		klog.ErrorS(err, "dbdaemon/open: newDB failed", "prelim", prelim)
-		if prelim {
-			// If a prelim connection is requested (e.g. for creating
-			// an spfile, also enable DBMS_OUTPUT.
-			db, err = newDB("godror", dbURL+"&prelim=1")
-		}
+		return nil, err
 	}
 
+	// If a prelim connection is requested (e.g. for creating
+	// an spfile) retry with prelim argument.
+	db, err = newDB("godror", dbURL+"&prelim=1")
 	if err != nil {
-		klog.ErrorS(err, "dbdaemon/open: newDB failed", "prelim", prelim)
+		klog.ErrorS(err, "dbdaemon/open: newDB failed prelim retry", "prelim", prelim)
 		return nil, err
 	}
 
@@ -687,6 +1047,7 @@ func (d *DB) runSQL(ctx context.Context, sqls []string, prelim, suppress bool, d
 }
 
 func (d *DB) runQuery(ctx context.Context, sqls []string, db oracleDatabase) ([]string, error) {
+	//TODO: Query suppression
 	klog.InfoS("dbdaemon/runQuery: running sql", "sql", sqls)
 	sqlLen := len(sqls)
 	for i := 0; i < sqlLen-1; i++ {
@@ -783,7 +1144,6 @@ func (s *Server) runSQLPlusHelper(ctx context.Context, req *dbdpb.RunSQLPlusCMDR
 		}
 	}
 
-	klog.InfoS("dbdaemon/runSQLPlusHelper: updated env ", "sid", s.databaseSid.val)
 	db, err := open(ctx, connectString, prelim)
 	if err != nil {
 		return nil, fmt.Errorf("dbdaemon/RunSQLPlus failed to open a database connection: %v", err)
@@ -813,33 +1173,33 @@ func (s *Server) runSQLPlusHelper(ctx context.Context, req *dbdpb.RunSQLPlusCMDR
 // This function only returns DBMS_OUTPUT and not any row data.
 // To read from SELECTs use RunSQLPlusFormatted.
 func (s *Server) RunSQLPlus(ctx context.Context, req *dbdpb.RunSQLPlusCMDRequest) (*dbdpb.RunCMDResponse, error) {
-	if req.GetSuppress() {
-		klog.InfoS("dbdaemon/RunSQLPlus", "req", "suppressed", "serverObj", s)
-	} else {
-		klog.InfoS("dbdaemon/RunSQLPlus", "req", req, "serverObj", s)
-	}
-
 	// Add lock to protect server state "databaseSid" and os env variable "ORACLE_SID".
 	// Only add lock in top level API to avoid deadlock.
 	s.databaseSid.Lock()
 	defer s.databaseSid.Unlock()
+
+	if req.GetSuppress() {
+		klog.InfoS("dbdaemon/RunSQLPlus", "req", "suppressed", "SID", s.databaseSid.val, "serverObj", s)
+	} else {
+		klog.InfoS("dbdaemon/RunSQLPlus", "req", req, "SID", s.databaseSid.val, "serverObj", s)
+	}
+
 	return s.runSQLPlusHelper(ctx, req, false)
 }
 
 // RunSQLPlusFormatted executes a SQL command and returns the row results.
 // If instead you want DBMS_OUTPUT please issue RunSQLPlus
 func (s *Server) RunSQLPlusFormatted(ctx context.Context, req *dbdpb.RunSQLPlusCMDRequest) (*dbdpb.RunCMDResponse, error) {
-	if req.GetSuppress() {
-		klog.InfoS("dbdaemon/RunSQLPlusFormatted", "req", "suppressed", "serverObj", s)
-	} else {
-		klog.InfoS("dbdaemon/RunSQLPlusFormatted", "req", req, "serverObj", s)
-	}
-	sqls := req.GetCommands()
-	klog.InfoS("dbdaemon/RunSQLPlusFormatted: executing formatted SQL commands", "sql", sqls)
 	// Add lock to protect server state "databaseSid" and os env variable "ORACLE_SID".
 	// Only add lock in top level API to avoid deadlock.
 	s.databaseSid.Lock()
 	defer s.databaseSid.Unlock()
+
+	if req.GetSuppress() {
+		klog.InfoS("dbdaemon/RunSQLPlusFormatted", "req", "suppressed", "SID", s.databaseSid.val, "serverObj", s)
+	} else {
+		klog.InfoS("dbdaemon/RunSQLPlusFormatted", "req", req, "SID", s.databaseSid.val, "serverObj", s)
+	}
 
 	return s.runSQLPlusHelper(ctx, req, true)
 }
@@ -974,9 +1334,9 @@ func (s *Server) RunRMAN(ctx context.Context, req *dbdpb.RunRMANRequest) (*dbdpb
 	// Add lock to protect server state "databaseSid" and os env variable "ORACLE_SID".
 	// Only add lock in top level API to avoid deadlock.
 	if req.GetSuppress() {
-		klog.Info("RunRMAN", "request", "suppressed")
+		klog.InfoS("RunRMAN", "request", "suppressed")
 	} else {
-		klog.Info("RunRMAN", "request", req)
+		klog.InfoS("RunRMAN", "request", req)
 	}
 
 	s.databaseSid.RLock()
@@ -1002,11 +1362,15 @@ func (s *Server) RunRMAN(ctx context.Context, req *dbdpb.RunRMANRequest) (*dbdpb
 	}
 	var res []string
 	for _, script := range scripts {
+		var args []string
 		target := "/"
 		if req.GetTarget() != "" {
 			target = req.GetTarget()
 		}
-		args := []string{fmt.Sprintf("target=%s", target)}
+
+		if !req.GetWithoutTarget() {
+			args = append(args, fmt.Sprintf("target=%s", target))
+		}
 
 		if req.GetAuxiliary() != "" {
 			args = append(args, fmt.Sprintf("auxiliary=%s", req.Auxiliary))
@@ -1022,7 +1386,7 @@ func (s *Server) RunRMAN(ctx context.Context, req *dbdpb.RunRMANRequest) (*dbdpb
 		}
 		res = append(res, string(out))
 
-		if req.GetGcsPath() != "" && req.GetCmd() == consts.RMANBackup {
+		if req.GetGcsPath() != "" && req.GetGcsOp() == dbdpb.RunRMANRequest_UPLOAD {
 			if err = s.uploadDirectoryContentsToGCS(ctx, consts.RMANStagingDir, req.GetGcsPath()); err != nil {
 				klog.ErrorS(err, "GCS Upload error:")
 				return nil, err
@@ -1046,6 +1410,49 @@ func (s *Server) RunRMANAsync(ctx context.Context, req *dbdpb.RunRMANAsyncReques
 	}
 
 	return &lropb.Operation{Name: job.ID(), Done: false}, nil
+}
+
+// RunDataGuardBroker RPC call executes Oracle's Data Guard command line utility.
+func (s *Server) RunDataGuard(ctx context.Context, req *dbdpb.RunDataGuardRequest) (*dbdpb.RunDataGuardResponse, error) {
+	s.databaseSid.RLock()
+	defer s.databaseSid.RUnlock()
+	if err := os.Setenv("ORACLE_SID", s.databaseSid.val); err != nil {
+		return nil, fmt.Errorf("failed to set env variable: %v", err)
+	}
+	if err := os.Setenv("ORACLE_HOME", s.databaseHome); err != nil {
+		return nil, fmt.Errorf("failed to set env variable: %v", err)
+	}
+
+	scripts := req.GetScripts()
+	if len(scripts) < 1 {
+		return nil, fmt.Errorf("RunDataGuard requires at least 1 script to run, provided: %d", len(scripts))
+	}
+	var res []string
+	for _, script := range scripts {
+		target := "/"
+		if req.GetTarget() != "" {
+			target = req.GetTarget()
+		}
+		args := []string{"-silent", target}
+		args = append(args, script)
+		cmd := exec.CommandContext(ctx, dgmgrl(s.databaseHome), args...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("RunDataGuard failed, script: %q\nFailed with: %v\nErr: %v", script, string(out), err)
+		}
+		res = append(res, string(out))
+	}
+	return &dbdpb.RunDataGuardResponse{Output: res}, nil
+}
+
+// TNSPing RPC call executes Oracle's tnsping utility.
+func (s *Server) TNSPing(ctx context.Context, req *dbdpb.TNSPingRequest) (*dbdpb.TNSPingResponse, error) {
+	cmd := exec.CommandContext(ctx, tnsping(s.databaseHome), req.GetConnectionString())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("tnsping failed \n Failed with: %v\nErr: %v", string(out), err)
+	}
+	return &dbdpb.TNSPingResponse{}, nil
 }
 
 func (s *Server) uploadDirectoryContentsToGCS(ctx context.Context, backupDir, gcsPath string) error {
@@ -1177,6 +1584,8 @@ func (s *Server) GetDatabaseName(ctx context.Context, req *dbdpb.GetDatabaseName
 
 // BounceDatabase starts/stops request specified database.
 func (s *Server) BounceDatabase(ctx context.Context, req *dbdpb.BounceDatabaseRequest) (*dbdpb.BounceDatabaseResponse, error) {
+	s.databaseSid.RLock()
+	defer s.databaseSid.RUnlock()
 	klog.InfoS("BounceDatabase request delegated to proxy", "req", req)
 	database, err := s.dbdClient.BounceDatabase(ctx, req)
 	if err != nil {
@@ -1205,47 +1614,6 @@ func (s *Server) close() {
 	if err := s.dbdClientClose(); err != nil {
 		klog.Warningf("failed to close dbdaemon client: %v", err)
 	}
-}
-
-// BootstrapStandby perform bootstrap tasks for standby instance.
-func (s *Server) BootstrapStandby(ctx context.Context, req *dbdpb.BootstrapStandbyRequest) (*dbdpb.BootstrapStandbyResponse, error) {
-	klog.InfoS("dbdaemon/BootstrapStandby", "req", req)
-	cdbName := req.GetCdbName()
-	spfile := filepath.Join(fmt.Sprintf(consts.ConfigDir, consts.DataMount, cdbName), fmt.Sprintf("spfile%s.ora", cdbName))
-
-	resp, err := s.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: []string{"select value from v$parameter where name='spfile'"}})
-	if err != nil || len(resp.GetMsg()) < 1 {
-		return nil, fmt.Errorf("dbdaemon/BootstrapStandby: failed to check spfile, results: %v, err: %v", resp, err)
-	}
-	row := make(map[string]string)
-	if err := json.Unmarshal([]byte(resp.GetMsg()[0]), &row); err != nil {
-		return nil, err
-	}
-
-	value, _ := row["VALUE"]
-	if value != "" {
-		spfile = value
-	} else {
-		_, err := s.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: []string{fmt.Sprintf("create spfile='%s' from memory", spfile)}, Suppress: false})
-		if err != nil {
-			return nil, fmt.Errorf("dbdaemon/BootstrapStandby: failed to create spfile from memory: %v", err)
-		}
-	}
-
-	if _, err = s.dbdClient.SetEnv(ctx, &dbdpb.SetEnvRequest{
-		OracleHome: s.databaseHome,
-		CdbName:    req.GetCdbName(),
-		SpfilePath: spfile,
-	}); err != nil {
-		return nil, fmt.Errorf("dbdaemon/BootstrapStandby: proxy failed to SetEnv: %v", err)
-	}
-	klog.InfoS("dbdaemon/BootstrapStandby: spfile creation/relocation completed successfully")
-
-	if err := markProvisioned(); err != nil {
-		return nil, fmt.Errorf("dbdaemon/BootstrapStandby: error while creating provisioning file: %v", err)
-	}
-	klog.InfoS("dbdaemon/BootstrapStandby: Provisioning file created successfully")
-	return &dbdpb.BootstrapStandbyResponse{}, nil
 }
 
 // createCDB creates a database instance
@@ -1332,15 +1700,6 @@ func (s *Server) createCDB(ctx context.Context, req *dbdpb.CreateCDBRequest) (*d
 
 	klog.InfoS("dbdaemon/CreateCDB successfully completed")
 	return &dbdpb.CreateCDBResponse{}, nil
-}
-
-// CreateFile creates file based on request.
-func (s *Server) CreateFile(ctx context.Context, req *dbdpb.CreateFileRequest) (*dbdpb.CreateFileResponse, error) {
-	klog.InfoS("dbdaemon/CreateFile: ", "req", req)
-	if err := s.osUtil.createFile(req.GetPath(), strings.NewReader(req.GetContent())); err != nil {
-		return nil, fmt.Errorf("dbdaemon/CreateFile: create failed: %v", err)
-	}
-	return &dbdpb.CreateFileResponse{}, nil
 }
 
 // CreateCDBAsync turns CreateCDB into an async call.
@@ -1430,23 +1789,31 @@ func (s *Server) CreateListener(ctx context.Context, req *dbdpb.CreateListenerRe
 	if req.GetDbDomain() != "" {
 		domain = fmt.Sprintf(".%s", req.GetDbDomain())
 	}
+	// default CDB service name is <CDB Name>.<domain>
+	cdbServiceName := req.GetDatabaseName() + domain
+	if req.GetCdbServiceName() != "" {
+		cdbServiceName = req.GetCdbServiceName()
+	}
 	uid, gid, err := oracleUserUIDGID(true)
 	if err != nil {
 		return nil, fmt.Errorf("initDBListeners: get uid gid failed: %v", err)
 	}
 	l := &provision.ListenerInput{
-		DatabaseName: req.DatabaseName,
-		DatabaseBase: consts.OracleBase,
-		DatabaseHome: s.databaseHome,
-		DatabaseHost: s.hostName,
-		DBDomain:     domain,
+		DatabaseName:   req.DatabaseName,
+		DatabaseBase:   consts.OracleBase,
+		DatabaseHome:   s.databaseHome,
+		DatabaseHost:   s.hostName,
+		DBDomain:       domain,
+		CDBServiceName: cdbServiceName,
 	}
 
-	pdbNames, err := s.fetchPDBNames(ctx)
-	if err != nil {
-		return nil, err
+	if !req.GetExcludePdb() {
+		pdbNames, err := s.fetchPDBNames(ctx)
+		if err != nil {
+			return nil, err
+		}
+		l.PluggableDatabaseNames = pdbNames
 	}
-	l.PluggableDatabaseNames = pdbNames
 
 	lType := consts.SECURE
 	lDir := filepath.Join(listenerDir, lType)
@@ -1566,7 +1933,7 @@ func (s *Server) ReadDir(ctx context.Context, req *dbdpb.ReadDirRequest) (*dbdpb
 	if err != nil {
 		return nil, fmt.Errorf("dbdaemon/ReadDir os.Stat(%v) failed: %v ", req.GetPath(), err)
 	}
-	rpcCurrFileInfo, err := convertToRpcFileInfo(currFileInfo, req.GetPath())
+	rpcCurrFileInfo, err := convertToRpcFileInfo(currFileInfo, req.GetPath(), req.GetReadFileContent())
 	if err != nil {
 		return nil, fmt.Errorf("dbdaemon/ReadDir failed: %v ", err)
 	}
@@ -1591,7 +1958,7 @@ func (s *Server) ReadDir(ctx context.Context, req *dbdpb.ReadDirRequest) (*dbdpb
 			if path == req.GetPath() {
 				return nil
 			}
-			rpcInfo, err := convertToRpcFileInfo(info, path)
+			rpcInfo, err := convertToRpcFileInfo(info, path, req.GetReadFileContent())
 			if err != nil {
 				return fmt.Errorf("visit %v, %v failed: %v ", info, path, err)
 			}
@@ -1606,7 +1973,7 @@ func (s *Server) ReadDir(ctx context.Context, req *dbdpb.ReadDirRequest) (*dbdpb
 			return nil, fmt.Errorf("dbdaemon/ReadDir ioutil.ReadDir(%v) failed: %v ", req.GetPath(), err)
 		}
 		for _, info := range subFileInfos {
-			rpcInfo, err := convertToRpcFileInfo(info, filepath.Join(req.GetPath(), info.Name()))
+			rpcInfo, err := convertToRpcFileInfo(info, filepath.Join(req.GetPath(), info.Name()), req.GetReadFileContent())
 			if err != nil {
 				return nil, fmt.Errorf("dbdaemon/ReadDir failed: %v ", err)
 			}
@@ -1617,11 +1984,20 @@ func (s *Server) ReadDir(ctx context.Context, req *dbdpb.ReadDirRequest) (*dbdpb
 	return resp, nil
 }
 
-func convertToRpcFileInfo(info os.FileInfo, absPath string) (*dbdpb.ReadDirResponse_FileInfo, error) {
+func convertToRpcFileInfo(info os.FileInfo, absPath string, readContent bool) (*dbdpb.ReadDirResponse_FileInfo, error) {
 	timestampProto, err := ptypes.TimestampProto(info.ModTime())
 	if err != nil {
 		return nil, fmt.Errorf("convertToRpcFileInfo(%v) failed: %v", info, err)
 	}
+
+	var content []byte
+	if readContent && !info.IsDir() {
+		content, err = ioutil.ReadFile(absPath)
+		if err != nil {
+			return nil, fmt.Errorf("convertToRpcFileInfo(%v) failed reading file: %v", info, err)
+		}
+	}
+
 	return &dbdpb.ReadDirResponse_FileInfo{
 		Name:    info.Name(),
 		Size:    info.Size(),
@@ -1629,6 +2005,7 @@ func convertToRpcFileInfo(info os.FileInfo, absPath string) (*dbdpb.ReadDirRespo
 		ModTime: timestampProto,
 		IsDir:   info.IsDir(),
 		AbsPath: absPath,
+		Content: string(content),
 	}, nil
 }
 
@@ -1704,7 +2081,7 @@ func New(ctx context.Context, cdbNameFromYaml string) (*Server, error) {
 		dbdClientClose: conn.Close,
 		lroServer:      lro.NewServer(ctx),
 		syncJobs:       &syncJobs{},
-		gcsUtil:        &gcsUtilImpl{},
+		gcsUtil:        &util.GCSUtilImpl{},
 	}
 
 	oracleHome := os.Getenv("ORACLE_HOME")
@@ -1759,6 +2136,7 @@ func (s *Server) DownloadDirectoryFromGCS(ctx context.Context, req *dbdpb.Downlo
 				return nil, fmt.Errorf("failed to download file %s", err)
 			}
 		}
+
 	}
 	return &dbdpb.DownloadDirectoryFromGCSResponse{}, nil
 }
@@ -1797,21 +2175,20 @@ func (s *Server) downloadFile(ctx context.Context, c *storage.Client, bucket, gc
 
 // bootstrapDatabase invokes init_oracle on dbdaemon_proxy to perform bootstrap tasks for seeded image
 func (s *Server) bootstrapDatabase(ctx context.Context, req *dbdpb.BootstrapDatabaseRequest) (*dbdpb.BootstrapDatabaseResponse, error) {
-	cmd := "free -m | awk '/Mem/ {print $2}'"
-	out, err := exec.Command("bash", "-c", cmd).Output()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to execute command %s: %s", cmd, err)
-	}
-
-	freeMem, err := strconv.Atoi(string(out[:len(out)-1]))
-	if err != nil {
-		return nil, fmt.Errorf("Failed to convert output %s to integer: %s", string(out), err)
+	var pga, sga int
+	if requestedMem, err := controllers.RequestedMemoryInMi(); err == nil {
+		klog.Info("Database requested memory in Mi", "memory", requestedMem)
+		pga = requestedMem / 8
+		sga = requestedMem / 2
+	} else {
+		pga = consts.DefaultPGAMB
+		sga = consts.DefaultSGAMB
 	}
 
 	if _, err := s.dbdClient.ProxyRunInitOracle(ctx, &dbdpb.ProxyRunInitOracleRequest{
 		Params: []string{
-			fmt.Sprintf("--pga=%d", freeMem/8),
-			fmt.Sprintf("--sga=%d", freeMem/2),
+			fmt.Sprintf("--pga=%d", pga),
+			fmt.Sprintf("--sga=%d", sga),
 			fmt.Sprintf("--cdb_name=%s", req.GetCdbName()),
 			fmt.Sprintf("--db_domain=%s", req.GetDbDomain()),
 			"--logtostderr=true",

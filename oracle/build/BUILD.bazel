@@ -35,6 +35,25 @@ container_push(
     image = ":dbinit",
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/dbinit",
+    stamp = "@io_bazel_rules_docker//stamp:always",
+    tag = TAG,
+)
+
+container_image(
+    name = "pitragent",
+    base = "//oracle:base_image",
+    files = [
+        "//oracle/cmd/pitr_agent",
+    ],
+)
+
+container_push(
+    name = "pitragent_push",
+    format = "OCI",
+    image = ":pitragent",
+    registry = REGISTRY,
+    repository = PROJECT + "/oracle.db.anthosapis.com/pitragent",
+    stamp = "@io_bazel_rules_docker//stamp:always",
     tag = TAG,
 )
 
@@ -53,6 +72,7 @@ container_push(
     image = ":dbdaemon_client",
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/dbdaemonclient",
+    stamp = "@io_bazel_rules_docker//stamp:always",
     tag = TAG,
 )
 
@@ -73,19 +93,24 @@ container_push(
     image = ":loggingsidecar",
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/loggingsidecar",
+    stamp = "@io_bazel_rules_docker//stamp:always",
     tag = TAG,
 )
 
 container_image(
     name = "monitoring",
-    base = "//oracle:base_image_with_busybox",
+    base = "//oracle:base_image",
     entrypoint = ["/monitoring"],
     files = [
         "//oracle/cmd/monitoring",
-        "//oracle/pkg/agents/monitoring:monitoring_files",
+        "//oracle/cmd/monitoring:monitoring_files",
     ],
     ports = ["9161"],
     symlinks = {"/monitoring_agent": "/monitoring"},
+    tars = [
+        "@aio_runtime//:binaries_tar",
+        "@oracle_instantclient//:binaries_tar",
+    ],
 )
 
 container_push(
@@ -94,6 +119,7 @@ container_push(
     image = ":monitoring",
     registry = REGISTRY,
     repository = PROJECT + "/oracle.db.anthosapis.com/monitoring",
+    stamp = "@io_bazel_rules_docker//stamp:always",
     tag = TAG,
 )
 

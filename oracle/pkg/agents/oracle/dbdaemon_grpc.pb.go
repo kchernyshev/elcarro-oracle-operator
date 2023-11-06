@@ -43,6 +43,11 @@ type DatabaseDaemonClient interface {
 	RunRMAN(ctx context.Context, in *RunRMANRequest, opts ...grpc.CallOption) (*RunRMANResponse, error)
 	// RunRMANAsync RPC call executes Oracle's rman utility asynchronously.
 	RunRMANAsync(ctx context.Context, in *RunRMANAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
+	// RunDataGuardBroker RPC call executes Oracle's Data Guard command line
+	// utility.
+	RunDataGuard(ctx context.Context, in *RunDataGuardRequest, opts ...grpc.CallOption) (*RunDataGuardResponse, error)
+	// TNSPing RPC call executes Oracle's tnsping utility.
+	TNSPing(ctx context.Context, in *TNSPingRequest, opts ...grpc.CallOption) (*TNSPingResponse, error)
 	// NID changes a database id and/or database name.
 	NID(ctx context.Context, in *NIDRequest, opts ...grpc.CallOption) (*NIDResponse, error)
 	// GetDatabaseType returns database type(eg. ORACLE_12_2_ENTERPRISE_NONCDB)
@@ -75,6 +80,9 @@ type DatabaseDaemonClient interface {
 	DataPumpImportAsync(ctx context.Context, in *DataPumpImportAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	// DataPumpExportAsync exports data to a .dmp file using expdp
 	DataPumpExportAsync(ctx context.Context, in *DataPumpExportAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
+	// ApplyDataPatchAsync applies Oracle `datapatch` utility
+	// and starts DB (CDB+PDBs) up after patching
+	ApplyDataPatchAsync(ctx context.Context, in *ApplyDataPatchAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error)
 	// ListOperations lists operations that match the specified filter in the
 	// request.
 	ListOperations(ctx context.Context, in *longrunning.ListOperationsRequest, opts ...grpc.CallOption) (*longrunning.ListOperationsResponse, error)
@@ -207,6 +215,24 @@ func (c *databaseDaemonClient) RunRMANAsync(ctx context.Context, in *RunRMANAsyn
 	return out, nil
 }
 
+func (c *databaseDaemonClient) RunDataGuard(ctx context.Context, in *RunDataGuardRequest, opts ...grpc.CallOption) (*RunDataGuardResponse, error) {
+	out := new(RunDataGuardResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/RunDataGuard", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *databaseDaemonClient) TNSPing(ctx context.Context, in *TNSPingRequest, opts ...grpc.CallOption) (*TNSPingResponse, error) {
+	out := new(TNSPingResponse)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/TNSPing", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *databaseDaemonClient) NID(ctx context.Context, in *NIDRequest, opts ...grpc.CallOption) (*NIDResponse, error) {
 	out := new(NIDResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/NID", in, out, opts...)
@@ -324,6 +350,15 @@ func (c *databaseDaemonClient) DataPumpExportAsync(ctx context.Context, in *Data
 	return out, nil
 }
 
+func (c *databaseDaemonClient) ApplyDataPatchAsync(ctx context.Context, in *ApplyDataPatchAsyncRequest, opts ...grpc.CallOption) (*longrunning.Operation, error) {
+	out := new(longrunning.Operation)
+	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/ApplyDataPatchAsync", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *databaseDaemonClient) ListOperations(ctx context.Context, in *longrunning.ListOperationsRequest, opts ...grpc.CallOption) (*longrunning.ListOperationsResponse, error) {
 	out := new(longrunning.ListOperationsResponse)
 	err := c.cc.Invoke(ctx, "/agents.oracle.DatabaseDaemon/ListOperations", in, out, opts...)
@@ -432,6 +467,11 @@ type DatabaseDaemonServer interface {
 	RunRMAN(context.Context, *RunRMANRequest) (*RunRMANResponse, error)
 	// RunRMANAsync RPC call executes Oracle's rman utility asynchronously.
 	RunRMANAsync(context.Context, *RunRMANAsyncRequest) (*longrunning.Operation, error)
+	// RunDataGuardBroker RPC call executes Oracle's Data Guard command line
+	// utility.
+	RunDataGuard(context.Context, *RunDataGuardRequest) (*RunDataGuardResponse, error)
+	// TNSPing RPC call executes Oracle's tnsping utility.
+	TNSPing(context.Context, *TNSPingRequest) (*TNSPingResponse, error)
 	// NID changes a database id and/or database name.
 	NID(context.Context, *NIDRequest) (*NIDResponse, error)
 	// GetDatabaseType returns database type(eg. ORACLE_12_2_ENTERPRISE_NONCDB)
@@ -464,6 +504,9 @@ type DatabaseDaemonServer interface {
 	DataPumpImportAsync(context.Context, *DataPumpImportAsyncRequest) (*longrunning.Operation, error)
 	// DataPumpExportAsync exports data to a .dmp file using expdp
 	DataPumpExportAsync(context.Context, *DataPumpExportAsyncRequest) (*longrunning.Operation, error)
+	// ApplyDataPatchAsync applies Oracle `datapatch` utility
+	// and starts DB (CDB+PDBs) up after patching
+	ApplyDataPatchAsync(context.Context, *ApplyDataPatchAsyncRequest) (*longrunning.Operation, error)
 	// ListOperations lists operations that match the specified filter in the
 	// request.
 	ListOperations(context.Context, *longrunning.ListOperationsRequest) (*longrunning.ListOperationsResponse, error)
@@ -527,6 +570,12 @@ func (UnimplementedDatabaseDaemonServer) RunRMAN(context.Context, *RunRMANReques
 func (UnimplementedDatabaseDaemonServer) RunRMANAsync(context.Context, *RunRMANAsyncRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RunRMANAsync not implemented")
 }
+func (UnimplementedDatabaseDaemonServer) RunDataGuard(context.Context, *RunDataGuardRequest) (*RunDataGuardResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunDataGuard not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) TNSPing(context.Context, *TNSPingRequest) (*TNSPingResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TNSPing not implemented")
+}
 func (UnimplementedDatabaseDaemonServer) NID(context.Context, *NIDRequest) (*NIDResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method NID not implemented")
 }
@@ -565,6 +614,9 @@ func (UnimplementedDatabaseDaemonServer) DataPumpImportAsync(context.Context, *D
 }
 func (UnimplementedDatabaseDaemonServer) DataPumpExportAsync(context.Context, *DataPumpExportAsyncRequest) (*longrunning.Operation, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DataPumpExportAsync not implemented")
+}
+func (UnimplementedDatabaseDaemonServer) ApplyDataPatchAsync(context.Context, *ApplyDataPatchAsyncRequest) (*longrunning.Operation, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ApplyDataPatchAsync not implemented")
 }
 func (UnimplementedDatabaseDaemonServer) ListOperations(context.Context, *longrunning.ListOperationsRequest) (*longrunning.ListOperationsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListOperations not implemented")
@@ -804,6 +856,42 @@ func _DatabaseDaemon_RunRMANAsync_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_RunDataGuard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RunDataGuardRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).RunDataGuard(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/RunDataGuard",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).RunDataGuard(ctx, req.(*RunDataGuardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DatabaseDaemon_TNSPing_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TNSPingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).TNSPing(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/TNSPing",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).TNSPing(ctx, req.(*TNSPingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DatabaseDaemon_NID_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NIDRequest)
 	if err := dec(in); err != nil {
@@ -1038,6 +1126,24 @@ func _DatabaseDaemon_DataPumpExportAsync_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DatabaseDaemon_ApplyDataPatchAsync_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyDataPatchAsyncRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DatabaseDaemonServer).ApplyDataPatchAsync(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/agents.oracle.DatabaseDaemon/ApplyDataPatchAsync",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DatabaseDaemonServer).ApplyDataPatchAsync(ctx, req.(*ApplyDataPatchAsyncRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DatabaseDaemon_ListOperations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(longrunning.ListOperationsRequest)
 	if err := dec(in); err != nil {
@@ -1252,6 +1358,14 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DatabaseDaemon_RunRMANAsync_Handler,
 		},
 		{
+			MethodName: "RunDataGuard",
+			Handler:    _DatabaseDaemon_RunDataGuard_Handler,
+		},
+		{
+			MethodName: "TNSPing",
+			Handler:    _DatabaseDaemon_TNSPing_Handler,
+		},
+		{
 			MethodName: "NID",
 			Handler:    _DatabaseDaemon_NID_Handler,
 		},
@@ -1302,6 +1416,10 @@ var DatabaseDaemon_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DataPumpExportAsync",
 			Handler:    _DatabaseDaemon_DataPumpExportAsync_Handler,
+		},
+		{
+			MethodName: "ApplyDataPatchAsync",
+			Handler:    _DatabaseDaemon_ApplyDataPatchAsync_Handler,
 		},
 		{
 			MethodName: "ListOperations",

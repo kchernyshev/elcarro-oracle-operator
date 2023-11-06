@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -37,9 +38,10 @@ import (
 // ExportReconciler reconciles an export object.
 type ExportReconciler struct {
 	client.Client
-	Log      logr.Logger
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Log           logr.Logger
+	Scheme        *runtime.Scheme
+	Recorder      record.EventRecorder
+	InstanceLocks *sync.Map
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
 }
@@ -95,10 +97,10 @@ var (
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile is a generic reconcile function for Export resources.
-func (r *ExportReconciler) Reconcile(_ context.Context, req ctrl.Request) (result ctrl.Result, recErr error) {
+func (r *ExportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, recErr error) {
 	log := r.Log.WithValues("Export", req.NamespacedName)
 	log.Info("reconciling export")
-	ctx, cancel := context.WithTimeout(context.Background(), reconcileTimeout)
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
 	defer cancel()
 
 	exp := &v1alpha1.Export{}

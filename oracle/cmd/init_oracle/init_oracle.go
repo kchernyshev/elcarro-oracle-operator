@@ -39,7 +39,7 @@ import (
 )
 
 const (
-	bootstrapTimeout       = 19 * time.Minute
+	bootstrapTimeout       = 29 * time.Minute
 	minRequiredFreeMemInKB = 6 * 1000 * 1000 // At least 6 Gigs is required for consistently successful bootstrapping
 )
 
@@ -134,10 +134,7 @@ func markProvisioned() error {
 	return nil
 }
 
-func reinitUnseededHost(ctx context.Context, oracleHome, cdbName string) error {
-	if err := provision.RelinkConfigFiles(oracleHome, cdbName); err != nil {
-		return err
-	}
+func reinitUnseededHost(ctx context.Context, cdbName string) error {
 	dbdClient, closeConn, err := newDBDClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create database daemon client: %v", err)
@@ -183,7 +180,7 @@ func main() {
 	}
 
 	if *reinit {
-		if err := reinitProvisionedHost(ctx, oracleHome, cdbNameFromImage, *cdbNameFromYaml, version); err != nil {
+		if err := reinitProvisionedHost(ctx, cdbNameFromImage, *cdbNameFromYaml, version); err != nil {
 			klog.ErrorS(err, "Reinit provisioned host failed")
 			os.Exit(consts.DefaultExitErrorCode)
 		}
@@ -213,11 +210,11 @@ func main() {
 			os.Exit(consts.DefaultExitErrorCode)
 		}
 
-		klog.ErrorS(err, "CDB provisioning DONE")
+		klog.InfoS("CDB provisioning DONE")
 	}
 }
 
-func reinitProvisionedHost(ctx context.Context, oracleHome, cdbNameFromImage, cdbNameFromYaml, version string) error {
+func reinitProvisionedHost(ctx context.Context, cdbNameFromImage, cdbNameFromYaml, version string) error {
 	isImageSeeded := cdbNameFromImage != ""
 	if isImageSeeded {
 		klog.InfoS("Reinitialize provisioned seeded database")
@@ -231,7 +228,7 @@ func reinitProvisionedHost(ctx context.Context, oracleHome, cdbNameFromImage, cd
 	} else {
 		klog.InfoS("Reinitialize provisioned unseeded database")
 
-		if err := reinitUnseededHost(ctx, oracleHome, cdbNameFromYaml); err != nil {
+		if err := reinitUnseededHost(ctx, cdbNameFromYaml); err != nil {
 			klog.Error(err, "CDB reinitialization failed")
 			return fmt.Errorf("failed to reinitialize provisioned unseeded database: %v", err)
 		}

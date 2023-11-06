@@ -41,7 +41,6 @@ import (
 var (
 	k8sClient                 client.Client
 	k8sManager                ctrl.Manager
-	reconciler                *DatabaseReconciler
 	DatabaseName              = testhelpers.RandName("db1")
 	Namespace                 = testhelpers.RandName("ns1")
 	fakeDatabaseClientFactory *testhelpers.FakeDatabaseClientFactory
@@ -69,23 +68,24 @@ func TestDatabaseController(t *testing.T) {
 				Recorder:              k8sManager.GetEventRecorderFor("database-controller"),
 				DatabaseClientFactory: fakeDatabaseClientFactory,
 			}}
-		})
+		},
+		[]string{}, // Use default CRD locations
+	)
 }
 
 var _ = Describe("Database controller", func() {
 	// Define utility constants for object names and testing timeouts and intervals.
 	const (
-		containerDatabaseName = "oracledb"
-		instanceName          = "mydb"
-		podName               = "podname"
-		svcName               = "mydb-svc"
-		svcAgentName          = "mydb-agent-svc"
-		adminPassword         = "pwd123"
-		userName              = "joice"
-		password              = "guess"
-		privileges            = "connect"
-		timeout               = time.Second * 15
-		interval              = time.Millisecond * 15
+		instanceName  = "mydb"
+		podName       = "podname"
+		svcName       = "mydb-svc"
+		svcAgentName  = "mydb-agent-svc"
+		adminPassword = "pwd123"
+		userName      = "joice"
+		password      = "guess"
+		privileges    = "connect"
+		timeout       = time.Second * 15
+		interval      = time.Millisecond * 15
 	)
 
 	ctx := context.Background()
@@ -100,11 +100,11 @@ var _ = Describe("Database controller", func() {
 	// Currently we only have one create database tests, after each
 	// serves as finally resource clean-up.
 	AfterEach(func() {
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: DatabaseName}, createdDatabase)
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: instanceName}, createdInstance)
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: podName, Namespace: Namespace}, createdPod)
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcAgentName, Namespace: Namespace}, createdAgentSvc)
 		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Name: svcName, Namespace: Namespace}, createdSvc)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: DatabaseName}, createdDatabase)
 		// Namespace objects can not be completely deleted in testenv.
 		testhelpers.K8sDeleteWithRetryNoWait(k8sClient, ctx, client.ObjectKey{Name: Namespace}, createdNs)
 	})
@@ -136,7 +136,7 @@ var _ = Describe("Database controller", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      podName,
 					Namespace: Namespace,
-					Labels:    map[string]string{"instance": instanceName},
+					Labels:    map[string]string{"instance": instanceName, "task-type": controllers.DatabaseTaskType},
 				},
 				Spec: v1.PodSpec{
 					Containers: []v1.Container{

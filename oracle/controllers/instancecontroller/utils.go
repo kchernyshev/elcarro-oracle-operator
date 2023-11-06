@@ -16,28 +16,36 @@ package instancecontroller
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/pkg/utils"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/databasecontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
 	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/security"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
-
 	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
 // loadConfig attempts to find a customer specific Operator config
@@ -66,14 +74,11 @@ func (r *InstanceReconciler) updateProgressCondition(ctx context.Context, inst v
 
 	log.Info("updateProgressCondition", "operation", op, "iReadyCond", iReadyCond)
 	progress, err := r.statusProgress(ctx, ns, fmt.Sprintf(controllers.StsName, inst.Name), log)
-	if err != nil && iReadyCond != nil {
-		if progress > 0 {
-			k8s.InstanceUpsertCondition(&inst.Status, iReadyCond.Type, iReadyCond.Status, iReadyCond.Reason, fmt.Sprintf("%s: %d%%", op, progress))
-		}
+	if iReadyCond != nil && progress > 0 {
+		k8s.InstanceUpsertCondition(&inst.Status, iReadyCond.Type, iReadyCond.Status, iReadyCond.Reason, fmt.Sprintf("%s: %d%%", op, progress))
 		log.Info("updateProgressCondition", "statusProgress", err)
-		return false
 	}
-	return true
+	return err == nil
 }
 
 // updateIsChangeApplied sets instance.Status.IsChangeApplied field to false if observedGeneration < generation, it sets it to true if changes are applied.
@@ -100,7 +105,7 @@ func (r *InstanceReconciler) createStatefulSet(ctx context.Context, inst *v1alph
 		log.Error(err, "NewPVCs failed")
 		return ctrl.Result{}, err
 	}
-	newPodTemplate := controllers.NewPodTemplate(sp, inst.Spec.CDBName, controllers.GetDBDomain(inst))
+	newPodTemplate := controllers.NewPodTemplate(sp, *inst)
 	sts, err := controllers.NewSts(sp, newPVCs, newPodTemplate)
 	if err != nil {
 		log.Error(err, "failed to create a StatefulSet", "sts", sts)
@@ -108,42 +113,215 @@ func (r *InstanceReconciler) createStatefulSet(ctx context.Context, inst *v1alph
 	}
 	log.Info("StatefulSet constructed", "sts", sts, "sts.Status", sts.Status, "inst.Status", inst.Status)
 
-	if err := r.Patch(ctx, sts, client.Apply, applyOpts...); err != nil {
-		log.Error(err, "failed to patch the StatefulSet", "sts.Status", sts.Status)
+	baseSTS := &appsv1.StatefulSet{}
+	sts.DeepCopyInto(baseSTS)
+	if _, err := ctrl.CreateOrUpdate(ctx, r, baseSTS, func() error {
+		sts.Spec.DeepCopyInto(&baseSTS.Spec)
+		return nil
+	}); err != nil {
+		log.Error(err, "failed to create the StatefulSet", "sts.Status", sts.Status)
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }
 
-func (r *InstanceReconciler) createAgentDeployment(ctx context.Context, inst v1alpha1.Instance, config *v1alpha1.Config, images map[string]string, enabledServices []commonv1alpha1.Service, applyOpts []client.PatchOption, log logr.Logger) (ctrl.Result, error) {
-	agentParam := controllers.AgentDeploymentParams{
-		Inst:           &inst,
-		Config:         config,
-		Scheme:         r.Scheme,
-		Name:           fmt.Sprintf(controllers.AgentDeploymentName, inst.Name),
-		Images:         images,
-		PrivEscalation: false,
-		Log:            log,
-		Args:           controllers.GetLogLevelArgs(config),
-		Services:       enabledServices,
+func (r *InstanceReconciler) removeMonitoringDeployment(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (bool, error) {
+	var monitor appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKey{Namespace: inst.Namespace, Name: GetMonitoringDepName(inst.Name)}, &monitor); err == nil {
+		if err := r.Delete(ctx, &monitor); err != nil {
+			log.Error(err, "failed to delete monitoring deployment", "InstanceName", inst.Name, "MonitorDeployment", monitor.Name)
+			return false, err
+		}
+		return true, nil
+	} else if !apierrors.IsNotFound(err) { // retry on other errors.
+		return false, err
 	}
-	agentDeployment, err := controllers.NewAgentDeployment(agentParam)
+	return false, nil
+}
+
+func (r *InstanceReconciler) stopMonitoringDeployment(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) error {
+	config, err := r.loadConfig(ctx, inst.Namespace)
 	if err != nil {
-		log.Info("createAgentDeployment: error in function NewAgentDeployment")
-		log.Error(err, "failed to create a Deployment", "agent deployment", agentDeployment)
-		return ctrl.Result{}, err
-	} else if agentDeployment == nil {
-		log.Info("createAgentDeployment: Agent Deployment not needed since it would contain no pods")
-		return ctrl.Result{}, nil
+		return err
 	}
-	log.Info("createAgentDeployment: function NewAgentDeployment succeeded")
-	if err := r.Patch(ctx, agentDeployment, client.Apply, applyOpts...); err != nil {
-		log.Error(err, "failed to patch the Deployment", "agent deployment.Status", agentDeployment.Status)
+
+	images := CloneMap(r.Images)
+
+	if err := r.overrideDefaultImages(config, images, inst, log); err != nil {
+		return err
+	}
+
+	if err := r.createMonitoringDeployment(ctx, inst, controllers.StoppedReplicaCnt, images); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *InstanceReconciler) createMonitoringDeployment(ctx context.Context, inst *v1alpha1.Instance, replicas int32, images map[string]string) error {
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: inst.Namespace,
+			Name:      GetMonitoringDepName(inst.GetName()),
+		},
+	}
+	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+		if err := ctrlutil.SetOwnerReference(deployment, inst, r.Scheme()); err != nil {
+			return err
+		}
+		monitoringSecret, err := r.getMonitoringSecret(ctx, inst)
+		if err != nil {
+			return err
+		}
+		matchLabels := map[string]string{"instance": inst.Name, "task-type": controllers.MonitorTaskType}
+		deployment.Spec = appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			// Must match the agent deployment.
+			Selector: &metav1.LabelSelector{
+				MatchLabels: matchLabels,
+			},
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType},
+			Template: controllers.MonitoringPodTemplate(inst, monitoringSecret, images),
+		}
+		deployment.Spec.Template.Labels = matchLabels
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *InstanceReconciler) getMonitoringSecret(ctx context.Context, inst *v1alpha1.Instance) (*corev1.Secret, error) {
+	deploymentName := GetMonitoringDepName(inst.Name)
+	monitoringUserSecretName := fmt.Sprintf("%s-secret", deploymentName)
+	monitoringSecret := &corev1.Secret{}
+
+	if err := r.Get(ctx, client.ObjectKey{Namespace: inst.Namespace, Name: monitoringUserSecretName}, monitoringSecret); err != nil {
+		return monitoringSecret, fmt.Errorf("Error getting monitoring secret: %v", err)
+	}
+	return monitoringSecret, nil
+
+}
+
+func (r *InstanceReconciler) reconcileMonitoring(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger, images map[string]string) (ctrl.Result, error) {
+	requeueDuration := 0 * time.Second
+
+	deploymentName := GetMonitoringDepName(inst.Name)
+	monitoringUserSecretName := fmt.Sprintf("%s-secret", deploymentName)
+	monitoringUser := "gcsql$monitor"
+	monitoringSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: inst.Namespace,
+			Name:      monitoringUserSecretName,
+		},
+	}
+
+	if result, err := ctrl.CreateOrUpdate(ctx, r.Client, monitoringSecret, func() error {
+		if err := ctrlutil.SetOwnerReference(monitoringSecret, inst, r.Scheme()); err != nil {
+			return err
+		}
+		if monitoringSecret.Data == nil {
+			monitoringSecret.Data = make(map[string][]byte)
+		}
+		if len(monitoringSecret.Data["username"]) == 0 {
+			monitoringSecret.Data["username"] = []byte(monitoringUser)
+		}
+		if len(monitoringSecret.Data["password"]) == 0 {
+			monitoringPass, _ := security.RandOraclePassword()
+			monitoringSecret.Data["password"] = []byte(monitoringPass)
+		}
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("creating monitoring secret %s/%s: %w", monitoringSecret.Namespace, monitoringSecret.Name, err)
+	} else if result != ctrlutil.OperationResultNone {
+		// Wait until we are sure the secret is reconciled to create the user.
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	dbdClient, closeConn, err := r.DatabaseClientFactory.New(ctx, r, inst.GetNamespace(), inst.Name)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("createAgentDeployment: function Patch succeeded")
-	if err := r.Status().Update(ctx, &inst); err != nil {
-		log.Error(err, "failed to update an Instance status agent image returning error")
+	defer closeConn()
+
+	// Only if user doesnt exist.
+	// Create cdb user with access to all pdb.
+	resp, err := dbdClient.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{
+		Commands: []string{fmt.Sprintf("select username from dba_users where username='%s'", strings.ToUpper(monitoringUser))},
+	})
+
+	if err == nil && len(resp.GetMsg()) < 1 {
+		if _, err := dbdClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
+			Commands: []string{
+				fmt.Sprintf("create user %s identified by %s", monitoringUser, string(monitoringSecret.Data["password"])),
+				fmt.Sprintf("grant %s to %s container=all", "connect, select any dictionary", monitoringUser),
+				fmt.Sprintf("alter user %s set container_data=all container=current", monitoringUser),
+			},
+			Suppress: true,
+		}); err != nil {
+			log.Error(err, "Creating the monitoring user failed")
+			requeueDuration = 30 * time.Second
+		}
+	} else if err != nil {
+		// Wait for the database to be available
+		requeueDuration = 30 * time.Second
+	}
+
+	if err := r.createMonitoringDeployment(ctx, inst, controllers.DefaultReplicaCnt, images); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: requeueDuration}, nil
+}
+
+func (r *InstanceReconciler) stopDBStatefulset(ctx context.Context, req ctrl.Request, log logr.Logger) (ctrl.Result, error) {
+	var inst v1alpha1.Instance
+	if err := r.Get(ctx, req.NamespacedName, &inst); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      GetSTSName(inst.Name),
+			Namespace: inst.Namespace,
+		},
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get statefulset: %v", err)
+	}
+
+	sts.Spec.Replicas = pointer.Int32(controllers.StoppedReplicaCnt)
+	baseSTS := &appsv1.StatefulSet{}
+	sts.DeepCopyInto(baseSTS)
+	if _, err := ctrl.CreateOrUpdate(ctx, r, baseSTS, func() error {
+		sts.Spec.DeepCopyInto(&baseSTS.Spec)
+		return nil
+	}); err != nil {
+		log.Error(err, "failed to update the StatefulSet", "sts.Status", sts.Status)
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+
+}
+
+func (r *InstanceReconciler) deleteAgentSVC(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (ctrl.Result, error) {
+	if err := r.Delete(ctx, AgentSVC(*inst)); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "failed to delete agent svc", "InstanceName", inst.Name)
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *InstanceReconciler) deleteDBDSVC(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (ctrl.Result, error) {
+	if err := r.Delete(ctx, DbDaemonSVC(*inst)); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "failed to delete dbdaemon svc", "InstanceName", inst.Name)
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *InstanceReconciler) deleteDBLoadBalancer(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (ctrl.Result, error) {
+	if err := r.Delete(ctx, InstanceLB(*inst)); err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "failed to delete load balancer", "InstanceName", inst.Name)
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }
@@ -157,14 +335,17 @@ func (r *InstanceReconciler) createDBLoadBalancer(ctx context.Context, inst *v1a
 	var svcAnnotations map[string]string
 
 	lbType := corev1.ServiceTypeLoadBalancer
-	svcNameFull := fmt.Sprintf(controllers.SvcName, inst.Name)
+	svcNameFull := getSVCName(*inst)
 	svcAnnotations = utils.LoadBalancerAnnotations(inst.Spec.DBLoadBalancerOptions)
 
 	svc := &corev1.Service{
 		TypeMeta:   metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{Name: svcNameFull, Namespace: inst.Namespace, Annotations: svcAnnotations},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"instance": inst.Name},
+			Selector: map[string]string{
+				"instance":  inst.Name,
+				"task-type": controllers.DatabaseTaskType,
+			},
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "secure-listener",
@@ -186,7 +367,7 @@ func (r *InstanceReconciler) createDBLoadBalancer(ctx context.Context, inst *v1a
 	}
 
 	// Set the Instance resource to own the Service resource.
-	if err := ctrl.SetControllerReference(inst, svc, r.Scheme); err != nil {
+	if err := ctrl.SetControllerReference(inst, svc, r.Scheme()); err != nil {
 		return nil, err
 	}
 
@@ -198,7 +379,7 @@ func (r *InstanceReconciler) createDBLoadBalancer(ctx context.Context, inst *v1a
 }
 
 func (r *InstanceReconciler) createDataplaneServices(ctx context.Context, inst v1alpha1.Instance, applyOpts []client.PatchOption) (dbDaemonSvc *corev1.Service, agentSvc *corev1.Service, err error) {
-	dbDaemonSvc, err = controllers.NewDBDaemonSvc(&inst, r.Scheme)
+	dbDaemonSvc, err = controllers.NewDBDaemonSvc(&inst, r.Scheme())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -207,7 +388,7 @@ func (r *InstanceReconciler) createDataplaneServices(ctx context.Context, inst v
 		return nil, nil, err
 	}
 
-	agentSvc, err = controllers.NewAgentSvc(&inst, r.Scheme)
+	agentSvc, err = controllers.NewAgentSvc(&inst, r.Scheme())
 	if err != nil {
 		return nil, nil, err
 	} else if agentSvc == nil {
@@ -225,7 +406,7 @@ func (r *InstanceReconciler) createDataplaneServices(ctx context.Context, inst v
 
 // isImageSeeded determines from the service image metadata file if the image is seeded or unseeded.
 func (r *InstanceReconciler) isImageSeeded(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) (bool, error) {
-	log.Info("isImageSeeded: requesting image metadata...", inst.GetName())
+	log.Info("isImageSeeded: requesting image metadata...", "instance", inst.GetName())
 	dbClient, closeConn, err := r.DatabaseClientFactory.New(ctx, r, inst.GetNamespace(), inst.GetName())
 
 	if err != nil {
@@ -380,12 +561,52 @@ func (r *InstanceReconciler) statusProgress(ctx context.Context, ns, name string
 		return 85, fmt.Errorf("failed to find the right Pod %s in status Running: %s", name+"-0", foundPod.Status.Phase)
 	}
 
-	for _, c := range foundPod.Status.ContainerStatuses {
-		if c.Name == databasecontroller.DatabaseContainerName && c.Ready {
-			return 100, nil
+	for _, podCondition := range foundPod.Status.Conditions {
+		if podCondition.Type == "Ready" && podCondition.Status == "False" {
+			log.Info("statusProgress: podCondition.Type ready is False")
+			return 85, fmt.Errorf("failed to find the right Pod %s in status Running: %s", name+"-0", foundPod.Status.Phase)
+		}
+		if podCondition.Type == "ContainersReady" && podCondition.Status == "False" {
+			msg := "statusProgress: podCondition.Type ContainersReady is False"
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
 		}
 	}
-	return 85, fmt.Errorf("failed to find a database container in %+v", foundPod.Status.ContainerStatuses)
+
+	for _, c := range foundPod.Status.ContainerStatuses {
+		if !c.Ready {
+			msg := fmt.Sprintf("container %s is not ready", c.Name)
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
+		}
+		msg := fmt.Sprintf("container %s is ready", c.Name)
+		log.Info(msg)
+	}
+	for _, c := range foundPod.Status.InitContainerStatuses {
+		if !c.Ready {
+			msg := fmt.Sprintf("init container %s is not ready", c.Name)
+			log.Info(msg)
+			return 85, fmt.Errorf(msg)
+		}
+		msg := fmt.Sprintf("container %s is ready", c.Name)
+		log.Info(msg)
+	}
+
+	log.Info("Stateful set creation is complete")
+	return 100, nil
+}
+
+func IsPatchingStateMachineEntryCondition(enabledServices map[commonv1alpha1.Service]bool, activeImages map[string]string, spImages map[string]string, lastFailedImages map[string]string, instanceReadyCond *v1.Condition, dbInstanceCond *v1.Condition) bool {
+	if !(enabledServices[commonv1alpha1.Patching] &&
+		instanceReadyCond != nil &&
+		dbInstanceCond != nil &&
+		k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue)) {
+		return false
+	}
+	if !reflect.DeepEqual(activeImages, spImages) && (lastFailedImages == nil || !reflect.DeepEqual(lastFailedImages, spImages)) {
+		return true
+	}
+	return false
 }
 
 func (r *InstanceReconciler) isOracleUpAndRunning(ctx context.Context, inst *v1alpha1.Instance, namespace string, log logr.Logger) (bool, error) {
@@ -401,12 +622,80 @@ func (r *InstanceReconciler) isOracleUpAndRunning(ctx context.Context, inst *v1a
 	return true, nil
 }
 
+func (r *InstanceReconciler) updateDatabaseIncarnationStatus(ctx context.Context, inst *v1alpha1.Instance, log logr.Logger) error {
+	incResp, err := controllers.FetchDatabaseIncarnation(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name)
+	if err != nil {
+		return fmt.Errorf("failed to fetch current database incarnation: %v", err)
+	}
+
+	if inst.Status.CurrentDatabaseIncarnation != incResp.Incarnation {
+		inst.Status.LastDatabaseIncarnation = inst.Status.CurrentDatabaseIncarnation
+	}
+	inst.Status.CurrentDatabaseIncarnation = incResp.Incarnation
+	return nil
+}
+
 func CloneMap(source map[string]string) map[string]string {
 	clone := make(map[string]string, len(source))
 	for key, value := range source {
 		clone[key] = value
 	}
 	return clone
+}
+
+// Initiate a config_agent_helpers ApplyDataPatch() call
+// Create an LRO job "DatabasePatch_%s", instance.GetUID()
+// making the method idempotent (per instance)
+// Return err on failure, nil on success
+func (r *InstanceReconciler) startDatabasePatching(req ctrl.Request, ctx context.Context, inst v1alpha1.Instance, log logr.Logger) error {
+	log.Info("startDatabasePatching initiated")
+
+	// Call async ApplyDataPatch
+	log.Info("config_agent_helpers.ApplyDataPatch", "LRO", lroPatchingOperationID(inst))
+	resp, err := controllers.ApplyDataPatch(ctx, r, r.DatabaseClientFactory, inst.Namespace, inst.Name, controllers.ApplyDataPatchRequest{
+		LroInput: &controllers.LROInput{OperationId: lroPatchingOperationID(inst)},
+	})
+	if err != nil {
+		return fmt.Errorf("failed on ApplyDataPatch gRPC call: %w", err)
+	}
+	log.Info("config_agent_helpers.ApplyDataPatch", "response", resp)
+	return nil
+}
+
+// Check for patching LRO job status
+// Return (true, nil) if job is done
+// Return (false, nil) if job still in progress
+// Return (false, err) if the job failed
+func (r *InstanceReconciler) isDatabasePatchingDone(ctx context.Context, req ctrl.Request,
+	inst v1alpha1.Instance, log logr.Logger) (bool, error) {
+
+	// Get operation id
+	id := lroPatchingOperationID(inst)
+	operation, err := controllers.GetLROOperation(ctx, r.DatabaseClientFactory, r, id, req.Namespace, inst.Name)
+	if err != nil {
+		log.Info("GetLROOperation returned error", "error", err)
+		return false, nil
+	}
+	log.Info("GetLROOperation", "response", operation)
+	if !operation.Done {
+		// Still waiting
+		return false, nil
+	}
+
+	log.Info("LRO is DONE", "id", id)
+	if err := controllers.DeleteLROOperation(ctx, r.DatabaseClientFactory, r, id, req.Namespace, inst.Name); err != nil {
+		return false, fmt.Errorf("DeleteLROOperation returned an error: %w", err)
+	}
+
+	// remote LRO completed unsuccessfully
+	if operation.GetError() != nil {
+		return false, fmt.Errorf("config_agent.ApplyDataPatch() failed: %v", operation.GetError())
+	}
+	return true, nil
+}
+
+func lroPatchingOperationID(instance v1alpha1.Instance) string {
+	return fmt.Sprintf("DatabasePatch_%s", instance.GetUID())
 }
 
 // AcquireInstanceMaintenanceLock gives caller an exclusive maintenance
@@ -472,4 +761,403 @@ func ReleaseInstanceMaintenanceLock(ctx context.Context, k8sClient client.Client
 		return fmt.Errorf("requested owner: %s, failed to update the instance status: %v", owner, err)
 	}
 	return result
+}
+
+func (r *InstanceReconciler) handleResize(ctx context.Context, inst *v1alpha1.Instance, instanceReadyCond *v1.Condition, dbInstanceCond *v1.Condition, sp controllers.StsParams, applyOpts []client.PatchOption, log logr.Logger) (ctrl.Result, error) {
+
+	if !k8s.ConditionStatusEquals(instanceReadyCond, v1.ConditionTrue) && !k8s.ConditionStatusEquals(dbInstanceCond, v1.ConditionTrue) && !k8s.ConditionReasonEquals(instanceReadyCond, k8s.ResizingInProgress) {
+		return ctrl.Result{}, nil
+	}
+	sts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sp.StsName,
+			Namespace: inst.Namespace,
+		},
+	}
+
+	if err := r.Get(ctx, client.ObjectKeyFromObject(sts), sts); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to get statefulset: %v", err)
+	} else if apierrors.IsNotFound(err) {
+		log.Info("Recreating Stateful set")
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.ResizingInProgress, "Recreating statefulset")
+		if _, err := r.createStatefulSet(ctx, inst, sp, applyOpts, log); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	dbContainer := findContainer(sts.Spec.Template.Spec.Containers, controllers.DatabaseContainerName)
+	if dbContainer == nil {
+		return ctrl.Result{}, fmt.Errorf("could not find database container in pod template")
+	}
+
+	// CPU/Memory resize
+	if !cmp.Equal(inst.Spec.DatabaseResources, dbContainer.Resources) {
+		log.Info("Instance CPU/MEM resize required")
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.ResizingInProgress, "Resizing cpu/memory")
+
+		_, err := ctrl.CreateOrUpdate(ctx, r.Client, sts, func() error {
+			dbContainer := findContainer(sts.Spec.Template.Spec.Containers, controllers.DatabaseContainerName)
+			if dbContainer == nil {
+				return fmt.Errorf("could not find database container in pod temmplate")
+			}
+			dbContainer.Resources = inst.Spec.DatabaseResources
+			return nil
+		})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to update statefulset resources: %v", err)
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+
+	newSts, err := r.buildStatefulSet(ctx, inst, sp, nil, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	done, err := tryResizeDisksOf(ctx, r.Client, newSts, log)
+	if err != nil {
+		return ctrl.Result{}, err
+	} else if !done {
+		k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionFalse, k8s.ResizingInProgress, "Resizing disk")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if k8s.ConditionReasonEquals(instanceReadyCond, k8s.ResizingInProgress) {
+		ready, msg := IsReadyWithObj(sts)
+		if ready && cmp.Equal(inst.Spec.DatabaseResources, dbContainer.Resources) {
+			k8s.InstanceUpsertCondition(&inst.Status, k8s.Ready, v1.ConditionTrue, k8s.CreateComplete, msg)
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		if err := utils.VerifyPodsStatus(ctx, r.Client, sts); errors.Is(err, utils.ErrPodUnschedulable) {
+			return ctrl.Result{}, fmt.Errorf("Unschedulable pod %v", err)
+		} else if errors.Is(err, utils.ErrNoResources) {
+			return ctrl.Result{}, fmt.Errorf("Insufficient Resources %v", err)
+		}
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func tryResizeDisksOf(ctx context.Context, c client.Client, newSts *appsv1.StatefulSet, log logr.Logger) (bool, error) {
+	oldSts := &appsv1.StatefulSet{}
+	key := client.ObjectKeyFromObject(newSts)
+
+	if err := c.Get(ctx, key, oldSts); err != nil {
+		if apierrors.IsNotFound(err) {
+			// no existing sts, we only delete sts after all PVCs has been resized,
+			// so this is either a new sts or PVC has been resized.
+			// Still return false here so that the request is requeued and sts is recreated in the following cycle.s
+			return false, nil
+		}
+		return false,
+			fmt.Errorf("error getting statefulset [%v]: %v", key, err)
+	}
+
+	if !oldSts.DeletionTimestamp.IsZero() {
+		// sts has been requested to delete, let's wait for it to be completely gone
+		return false, nil
+	}
+
+	changedDisks := FilterDiskWithSizeChanged(
+		oldSts.Spec.VolumeClaimTemplates,
+		newSts.Spec.VolumeClaimTemplates,
+		log,
+	)
+
+	if len(changedDisks) == 0 {
+		// no disk has size changed
+		return true, nil
+	}
+
+	// sanity check: all sc can expand
+	if err := PvcsCanBeExpanded(ctx, c, newSts, changedDisks); err != nil {
+		return false,
+			fmt.Errorf("pvcs may not be expanded")
+	}
+	// actually do the update
+	done, err := resizePvcs(ctx, c, newSts, changedDisks, log)
+	if err != nil {
+		return false, err
+	}
+
+	if !done {
+		return false, nil
+	}
+
+	// resize done, now let's delete the sts
+	if err := c.Delete(ctx, oldSts); err != nil {
+		return false,
+			fmt.Errorf("error while deleting sts [%v]: %v", key, err)
+	}
+	return false, nil
+
+}
+
+// resizePvcs resizes the provided PVC templates, and return true if resize has
+// completed; false if it's done but PVC still undergoing resizing; or error if
+// and error occured during the resizing process
+func resizePvcs(ctx context.Context, c client.Client, sts *appsv1.StatefulSet, disks []*corev1.PersistentVolumeClaim, log logr.Logger,
+) (bool, error) {
+	done := true
+	var requested []string
+	var completed []string
+
+	for i := 0; i < int(*sts.Spec.Replicas); i++ {
+		for _, pvc := range disks {
+
+			key := utils.ObjectKeyOf(sts, pvc, i)
+			newSize := *pvc.Spec.Resources.Requests.Storage()
+
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := c.Get(ctx, key, pvc); err != nil {
+				return false,
+					fmt.Errorf("error getting pvc [%v]: %v", key, err)
+			}
+
+			if newSize.Equal(*pvc.Spec.Resources.Requests.Storage()) {
+				// spec has been updated before, check status
+				if !newSize.Equal(*pvc.Status.Capacity.Storage()) {
+					// status is not equal, meaning the resizing is still in-progress
+					done = false
+				} else {
+					completed = append(completed, key.String())
+				}
+			} else {
+				// spec is not updated yet, update it
+				done = false
+				oldCliObj := pvc.DeepCopyObject().(client.Object)
+				pvc.Spec.Resources.Requests[corev1.ResourceStorage] = newSize
+				if err := Patch(ctx, c, pvc, oldCliObj); err != nil {
+					return false,
+						fmt.Errorf("error resizing pvc [%v]: %v", key, err)
+				} else {
+					requested = append(requested, key.String())
+				}
+			}
+		}
+	}
+
+	if len(requested) != 0 || len(completed) != 0 {
+		log.Info(
+			fmt.Sprintf(
+				"PVC resizing, requested [%v], completed [%v]",
+				strings.Join(requested, ", "),
+				strings.Join(completed, ", ")))
+	}
+
+	return done, nil
+}
+
+// IsReadyWithObj returns true if the statefulset has a non-zero number of
+// desired replicas and has the same number of actual pods running and ready.
+func IsReadyWithObj(sts *appsv1.StatefulSet) (ready bool, msg string) {
+	var want int32
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	have := sts.Status.ReadyReplicas
+	if want == have {
+		if want == 0 {
+			return false, fmt.Sprintf("Statefulset %s/%s has zero replicas", sts.Namespace, sts.Name)
+		}
+		return true, fmt.Sprintf("Statefulset %s/%s is running", sts.Namespace, sts.Name)
+	}
+	return false, fmt.Sprintf("StatefulSet is not ready (current replicas: %d expected replicas: %d)", have, want)
+}
+
+func (r *InstanceReconciler) buildStatefulSet(ctx context.Context, inst *v1alpha1.Instance, sp controllers.StsParams, applyOpts []client.PatchOption, log logr.Logger) (*appsv1.StatefulSet, error) {
+
+	newPVCs, err := controllers.NewPVCs(sp)
+	if err != nil {
+		log.Error(err, "NewPVCs failed")
+		return nil, err
+	}
+	newPodTemplate := controllers.NewPodTemplate(sp, *inst)
+	sts, err := controllers.NewSts(sp, newPVCs, newPodTemplate)
+	if err != nil {
+		log.Error(err, "failed to create a StatefulSet", "sts", sts)
+		return nil, err
+	}
+	log.Info("StatefulSet constructed", "sts", sts, "sts.Status", sts.Status, "inst.Status", inst.Status)
+	return sts, nil
+}
+
+func findContainer(containers []corev1.Container, name string) *corev1.Container {
+	for i, c := range containers {
+		if c.Name == name {
+			return &containers[i]
+		}
+	}
+	return nil
+}
+
+// FilterDiskWithSizeChanged compare an old STS to a new STS and identify volumes that changed from old to new.
+func FilterDiskWithSizeChanged(old, new []corev1.PersistentVolumeClaim, log logr.Logger) []*corev1.PersistentVolumeClaim {
+	oldDisks := make(map[string]*resource.Quantity)
+	changedDisks := make([]*corev1.PersistentVolumeClaim, 0, len(new))
+
+	for _, c := range old {
+		oldDisks[c.GetName()] = c.Spec.Resources.Requests.Storage()
+	}
+
+	sb := strings.Builder{}
+	sb.WriteString("Detected disks with new size: ")
+
+	for i, c := range new {
+		newSize := c.Spec.Resources.Requests.Storage()
+		if oldSize, ok := oldDisks[c.GetName()]; ok && !oldSize.Equal(*newSize) {
+			sb.WriteString(fmt.Sprintf("[%v:%v->%v]", c.GetName(), oldSize.String(), newSize.String()))
+			changedDisks = append(changedDisks, &new[i])
+		}
+	}
+
+	if len(changedDisks) != 0 {
+		log.Info(sb.String())
+	}
+
+	return changedDisks
+}
+
+// pvcsCanBeExpanded checks all the pvcs has a storage class that can be expanded, and return an error if any one PVC
+// cannot be expanded.
+func PvcsCanBeExpanded(ctx context.Context, r client.Reader, sts *appsv1.StatefulSet,
+	pvcs []*corev1.PersistentVolumeClaim,
+) error {
+	for i := 0; i < int(*sts.Spec.Replicas); i++ {
+		for _, pvc := range pvcs {
+
+			// Need to get the actual PVC from kubernetes since empty storage class while creating could mean either manually
+			// provisioned or default storage class.
+			key := utils.ObjectKeyOf(sts, pvc, i)
+
+			if err := CheckSinglePvc(ctx, r, key); err != nil {
+				return err
+			}
+
+		}
+	}
+
+	return nil
+}
+
+// check pvc spec
+func CheckSinglePvc(ctx context.Context, r client.Reader, key client.ObjectKey) error {
+	tpvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, key, tpvc); err != nil {
+		return fmt.Errorf("error getting pvc [%v]: %v", key, err)
+	}
+
+	if tpvc.Spec.StorageClassName == nil || *tpvc.Spec.StorageClassName == "" {
+		return fmt.Errorf("cannot resize manually provisioned pvc [%v]", key)
+	}
+
+	scName := *tpvc.Spec.StorageClassName
+	sc := &storagev1.StorageClass{}
+	if err := r.Get(ctx, client.ObjectKey{Name: scName}, sc); err != nil {
+		return fmt.Errorf("error getting storageclass [%v]: %v", scName, err)
+	}
+
+	if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
+		return fmt.Errorf("storageclass [%v] does not allow expansion for volume [%v]", scName, tpvc.GetName())
+	}
+	return nil
+}
+
+// Patch attempts to patch the given object.
+func Patch(ctx context.Context, cli client.Client, newCliObj client.Object, oldCliObj client.Object) error {
+	// Make sure we're comparing objects with the same resourceVersion so that
+	// the patch data (i.e., the diff) doesn't include a resourceVersion.
+	// Otherwise, we could get a "the object has been modified; please apply
+	// your changes to the latest version and try again" error if the
+	// resourceVersion we're using is out of date.
+	oldCliObj.SetResourceVersion(newCliObj.GetResourceVersion())
+
+	patch := client.MergeFrom(oldCliObj)
+
+	// The client.Patch function will make a patch request even if the patch
+	// data is empty. So we'll check to see if a request is needed first to
+	// avoid making empty requests.
+	specOrMetaChanged, statusChanged, err := isObjectChanged(ctx, patch, newCliObj)
+	if err != nil {
+		return err
+	}
+
+	if specOrMetaChanged {
+		newCloned := newCliObj
+		if statusChanged {
+			// Patch() will change the object passed in. We'll pass in a cloned
+			// object so we still have the original for the status update below.
+			newCloned = newCliObj.DeepCopyObject().(client.Object)
+		}
+		if err := cli.Patch(ctx, newCloned, patch); err != nil {
+			return err
+		}
+	}
+	if statusChanged {
+		if err := cli.Status().Patch(ctx, newCliObj, patch); err != nil {
+			return err
+		}
+	}
+
+	// Replace h.old with the updated object, otherwise subsequent calls to
+	// Patch() will be comparing the changes with an outdated version of the
+	// object
+	oldCliObj = newCliObj.DeepCopyObject().(client.Object)
+
+	return nil
+}
+
+func isObjectChanged(ctx context.Context, patch client.Patch, obj client.Object) (specOrMetaChanged, statusChanged bool, err error) {
+	data, err := patch.Data(obj)
+	if err != nil {
+		return false, false, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return false, false, err
+	}
+
+	_, statusChanged = result["status"]
+	specOrMetaChanged = len(result) > 0 && !(len(result) == 1 && statusChanged)
+	return specOrMetaChanged, statusChanged, nil
+}
+
+func GetSTSName(instanceName string) string {
+	return fmt.Sprintf(controllers.StsName, instanceName)
+}
+
+func GetMonitoringDepName(instName string) string {
+	return fmt.Sprintf("%s-monitor", instName)
+}
+
+func getSVCName(instance v1alpha1.Instance) string {
+	return fmt.Sprintf(controllers.SvcName, instance.Name)
+}
+func InstanceLB(inst v1alpha1.Instance) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: inst.GetNamespace(),
+			Name:      getSVCName(inst),
+		},
+	}
+}
+
+func AgentSVC(inst v1alpha1.Instance) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: inst.GetNamespace(),
+			Name:      fmt.Sprintf(controllers.AgentSvcName, inst.Name),
+		},
+	}
+}
+
+func DbDaemonSVC(inst v1alpha1.Instance) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: inst.GetNamespace(),
+			Name:      fmt.Sprintf(controllers.DbdaemonSvcName, inst.Name),
+		},
+	}
 }

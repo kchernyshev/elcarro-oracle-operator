@@ -56,7 +56,7 @@ type resourceResolver interface {
 // cronAnythingControl provides methods for getting and updating CronAnything resources.
 type cronAnythingControl interface {
 	Get(key client.ObjectKey) (cronanything.CronAnything, error)
-	Update(ca cronanything.CronAnything) error
+	UpdateStatus(ca cronanything.CronAnything) error
 	Create(ns string, name string, cas cronanything.CronAnythingSpec, owner cronanything.BackupSchedule) error
 }
 
@@ -377,7 +377,7 @@ func (r *ReconcileCronAnything) updateCronAnythingStatus(name, namespace string,
 		}
 
 		updateFunc(instance.CronAnythingStatus())
-		return r.cronanythingControl.Update(instance)
+		return r.cronanythingControl.UpdateStatus(instance)
 	})
 }
 
@@ -648,7 +648,13 @@ func getResourceName(ca cronanything.CronAnything, scheduleTime time.Time) strin
 func getScheduleTimes(ca cronanything.CronAnything, now time.Time) ([]time.Time, time.Time, error) {
 	schedule, err := cron.ParseStandard(ca.CronAnythingSpec().Schedule)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("unable to parse schedule string: %v", err)
+		// Allow Full Cron formats if its invalid as a standard cron format.
+		var err2 error
+		schedule, err2 = cron.Parse(ca.CronAnythingSpec().Schedule)
+		if err2 != nil {
+			return nil, time.Time{}, fmt.Errorf("unable to parse schedule string: %v", err)
+		}
+		err = nil
 	}
 
 	var scheduleTimes []time.Time

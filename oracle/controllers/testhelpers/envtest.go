@@ -17,6 +17,7 @@ package testhelpers
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base32"
 	"errors"
 	"fmt"
@@ -24,13 +25,17 @@ import (
 	"io/ioutil"
 	logg "log"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/bazelbuild/rules_go/go/tools/bazel"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	. "github.com/onsi/ginkgo"
@@ -71,6 +76,15 @@ type Reconciler interface {
 	SetupWithManager(manager ctrl.Manager) error
 }
 
+// Webhook is the interface to setup a webhook for testing.
+type Webhook interface {
+	SetupWebhookWithManager(mgr ctrl.Manager) error
+}
+
+type AdmissionWebhook interface {
+	ServeHTTP(http.ResponseWriter, *http.Request)
+}
+
 // cdToRoot change to the repo root directory.
 func CdToRoot(t *testing.T) {
 	for {
@@ -101,10 +115,13 @@ func RandName(base string) string {
 // configures the test environment by taking the following actions:
 //
 // * Starting a control plane consisting of an etcd process and a Kubernetes API
-//   server process.
+//
+//	server process.
+//
 // * Installing CRDs into the control plane (using provided 'schemeBuilders')
 // * Starting an in-process manager in a dedicated goroutine with the given
-//   reconcilers installed in it.
+//
+//	reconcilers installed in it.
 //
 // These components will be torn down after the suite runs.
 func RunFunctionalTestSuite(
@@ -114,57 +131,154 @@ func RunFunctionalTestSuite(
 	schemeBuilders []*runtime.SchemeBuilder,
 	description string,
 	controllers func() []Reconciler,
-	crdPaths ...string) {
+	crdPaths []string,
+) {
+	RunFunctionalTestSuiteWithWebhooks(
+		t,
+		k8sClient,
+		k8sManager,
+		schemeBuilders,
+		description,
+		controllers,
+		crdPaths,
+		func() []Webhook { return []Webhook{} }, // No webhooks
+		func() map[string]AdmissionWebhook { return nil }, // No admission webhook handlers
+		[]string{}, // Use default Webhook locations
+	)
+}
+
+// RunFunctionalTestSuiteWithWebhooks extends RunFunctionalTestSuite
+// allowing to set up test webhooks
+func RunFunctionalTestSuiteWithWebhooks(
+	t *testing.T,
+	k8sClient *client.Client,
+	k8sManager *ctrl.Manager,
+	schemeBuilders []*runtime.SchemeBuilder,
+	description string,
+	controllers func() []Reconciler,
+	crdPaths []string,
+	webhooks func() []Webhook,
+	admissionWebhookHandlers func() map[string]AdmissionWebhook,
+	webhookPaths []string,
+) {
 	// Define the test environment.
 	crdPaths = append(crdPaths, filepath.Join("config", "crd", "bases"), filepath.Join("config", "crd", "testing"))
+
+	var testEnvLock sync.Mutex
 	testEnv := envtest.Environment{
 		CRDDirectoryPaths:        crdPaths,
 		ControlPlaneStartTimeout: 60 * time.Second, // Default 20s may not be enough for test pods.
 	}
-
+	// Set up webhooks
+	if len(webhookPaths) != 0 {
+		testEnv.WebhookInstallOptions = envtest.WebhookInstallOptions{
+			Paths:                    webhookPaths,
+			IgnoreErrorIfPathMissing: true,
+		}
+	}
 	if runfiles, err := bazel.RunfilesPath(); err == nil {
 		// Running with bazel test, find binary assets in runfiles.
 		testEnv.BinaryAssetsDirectory = filepath.Join(runfiles, "external/kubebuilder_tools/bin")
 	}
 
+	// k8s 1.21 introduced graceful shutdown so testEnv wont shutdown if we
+	// keep a connection open. By using a context with cancel we can
+	// shutdown our managers before we try to shutdown the testEnv and
+	// ensure no hanging connections keep the apiserver from stopping.
+	mgrCtx, mgrCancel := context.WithCancel(ctrl.SetupSignalHandler())
+
 	BeforeSuite(func(done Done) {
+		testEnvLock.Lock()
+		defer testEnvLock.Unlock()
 		klog.SetOutput(GinkgoWriter)
 		logf.SetLogger(klogr.NewWithOptions(klogr.WithFormat(klogr.FormatKlog)))
+		log := logf.FromContext(nil)
 
 		var err error
-		cfg, err := testEnv.Start()
-		Expect(err).ToNot(HaveOccurred())
-		Expect(cfg).ToNot(BeNil())
+		var cfg *rest.Config
+
+		var backoff = wait.Backoff{
+			Steps:    6,
+			Duration: 100 * time.Millisecond,
+			Factor:   5.0,
+			Jitter:   0.1,
+		}
+		Expect(retry.OnError(backoff, func(error) bool { return true }, func() error {
+			cfg, err = testEnv.Start()
+			if err != nil {
+				log.Error(err, "Envtest startup failed, retrying")
+			}
+			return err
+		})).Should(Succeed())
 
 		for _, sb := range schemeBuilders {
 			utilruntime.Must(sb.AddToScheme(scheme.Scheme))
 		}
 
-		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-			Scheme:             scheme.Scheme,
-			MetricsBindAddress: "0",
-		})
-		Expect(err).ToNot(HaveOccurred())
+		if len(webhookPaths) != 0 {
+			// start webhook server using Manager
+			webhookInstallOptions := &testEnv.WebhookInstallOptions
+			*k8sManager, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:             scheme.Scheme,
+				Host:               webhookInstallOptions.LocalServingHost,
+				Port:               webhookInstallOptions.LocalServingPort,
+				CertDir:            webhookInstallOptions.LocalServingCertDir,
+				LeaderElection:     false,
+				MetricsBindAddress: "0",
+			})
+			Expect(err).NotTo(HaveOccurred())
+		} else {
+			*k8sManager, err = ctrl.NewManager(cfg, ctrl.Options{
+				Scheme:             scheme.Scheme,
+				MetricsBindAddress: "0",
+			})
+			Expect(err).ToNot(HaveOccurred())
+		}
 
-		*k8sManager = mgr
-		*k8sClient = mgr.GetClient()
+		*k8sClient = (*k8sManager).GetClient()
 
 		// Install controllers into the manager.
 		for _, c := range controllers() {
-			Expect(c.SetupWithManager(mgr)).To(Succeed())
+			Expect(c.SetupWithManager(*k8sManager)).To(Succeed())
+		}
+		// Install webhooks into the manager.
+		for _, c := range webhooks() {
+			Expect(c.SetupWebhookWithManager(*k8sManager)).To(Succeed())
+		}
+		// Register admission webhook handlers into the webhook in the manager
+		for path, handler := range admissionWebhookHandlers() {
+			(*k8sManager).GetWebhookServer().Register(path, handler)
 		}
 
 		go func() {
 			defer GinkgoRecover()
-			err = mgr.Start(ctrl.SetupSignalHandler())
+			err = (*k8sManager).Start(mgrCtx)
 			Expect(err).ToNot(HaveOccurred())
 		}()
 
+		if len(webhookPaths) != 0 {
+			// wait for the webhook server to get ready
+			webhookInstallOptions := &testEnv.WebhookInstallOptions
+			dialer := &net.Dialer{Timeout: 60 * time.Second}
+			addrPort := fmt.Sprintf("%s:%d", webhookInstallOptions.LocalServingHost, webhookInstallOptions.LocalServingPort)
+			Eventually(func() error {
+				conn, err := tls.DialWithDialer(dialer, "tcp", addrPort, &tls.Config{InsecureSkipVerify: true})
+				if err != nil {
+					return err
+				}
+				conn.Close()
+				return nil
+			}, 60*time.Second, 5*time.Second).Should(Succeed())
+		}
+
 		close(done)
-	}, 300)
+	}, 600)
 
 	AfterSuite(func() {
+		testEnvLock.Lock()
+		defer testEnvLock.Unlock()
 		By("Stopping control plane")
+		mgrCancel()
 		Expect(testEnv.Stop()).To(Succeed())
 	})
 
@@ -180,6 +294,8 @@ var (
 	loggingSidecarImage  = "oracle.db.anthosapis.com/loggingsidecar"
 	monitoringAgentImage = "oracle.db.anthosapis.com/monitoring"
 	operatorImage        = "oracle.db.anthosapis.com/operator"
+	// Used by pitr test directly.
+	PitrAgentImage = "oracle.db.anthosapis.com/pitragent"
 )
 
 // Set up kubectl config targeting PROW_PROJECT / PROW_CLUSTER / PROW_CLUSTER_ZONE
@@ -300,6 +416,53 @@ func cleanupK8Cluster(CPNamespace string, DPNamespace string, k8sClient client.C
 	os.Remove(fmt.Sprintf("/tmp/.kubectl/config-%v", CPNamespace))
 }
 
+// EnableGsmApi ensures the GSM API enabled for PROW_PROJECT.
+func EnableGsmApi() {
+	// Enable GSM API.
+	log := logg.New(GinkgoWriter, "", 0)
+	projectId := os.Getenv("PROW_PROJECT")
+	Expect(projectId).ToNot(BeEmpty())
+	cmd := exec.Command("gcloud", "services", "enable", "secretmanager.googleapis.com", fmt.Sprintf("--project=%s", projectId))
+	out, err := cmd.CombinedOutput()
+	log.Printf("gcloud services enable secretmanager.googleapis.com output=%s", string(out))
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// EnableIamApi ensures the IAM API enabled for PROW_PROJECT.
+func EnableIamApi() {
+	// Enable IAM API.
+	log := logg.New(GinkgoWriter, "", 0)
+	projectId := os.Getenv("PROW_PROJECT")
+	Expect(projectId).ToNot(BeEmpty())
+	cmd := exec.Command("gcloud", "services", "enable", "iamcredentials.googleapis.com", fmt.Sprintf("--project=%s", projectId))
+	out, err := cmd.CombinedOutput()
+	log.Printf("gcloud services enable iamcredentials.googleapis.com output=%s", string(out))
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// EnableWiWithNodePool ensures workload identity enabled for PROW_CLUSTER.
+func EnableWiWithNodePool() {
+	log := logg.New(GinkgoWriter, "", 0)
+
+	projectId := os.Getenv("PROW_PROJECT")
+	targetCluster := os.Getenv("PROW_CLUSTER")
+	targetZone := os.Getenv("PROW_CLUSTER_ZONE")
+	Expect(projectId).ToNot(BeEmpty())
+	Expect(targetCluster).ToNot(BeEmpty())
+	Expect(targetZone).NotTo(BeEmpty())
+
+	// Enable workload identify on existing cluster.
+	cmd := exec.Command("gcloud", "container", "clusters", "update", targetCluster, "--workload-pool="+projectId+".svc.id.goog", "--zone="+targetZone, fmt.Sprintf("--project=%s", projectId))
+	out, err := cmd.CombinedOutput()
+	log.Printf("gcloud container clusters update output=%s", string(out))
+	Expect(err).NotTo(HaveOccurred())
+	// Migrate applications to Workload Identity with Node pool modification.
+	cmd = exec.Command("gcloud", "container", "node-pools", "update", "default-pool", "--cluster="+targetCluster, "--workload-metadata=GKE_METADATA", "--zone="+targetZone, fmt.Sprintf("--project=%s", projectId))
+	out, err = cmd.CombinedOutput()
+	log.Printf("gcloud container node-pools update output=%s", string(out))
+	Expect(err).NotTo(HaveOccurred())
+}
+
 // PrintEvents for all namespaces in the cluster.
 func PrintEvents() {
 	cmd := exec.Command("kubectl", "get", "events", "-A", "-o", "custom-columns=LastSeen:.metadata.creationTimestamp,From:.source.component,Type:.type,Reason:.reason,Message:.message", "--sort-by=.metadata.creationTimestamp")
@@ -416,8 +579,7 @@ func PrintLogs(CPNamespace string, DPNamespace string, env envtest.Environment, 
 
 // DeployOperator deploys an operator and returns a cleanup function to delete
 // all cluster level objects created outside of the namespace.
-// It also creates the data plane namespace if the data plane and control plane are separate.
-func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace string, DPNamespace string) (func() error, error) {
+func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace, DPNamespace string) (func() error, error) {
 	var agentImageTag, agentImageRepo, agentImageProject string
 	if agentImageTag = os.Getenv("PROW_IMAGE_TAG"); agentImageTag == "" {
 		return nil, errors.New("PROW_IMAGE_TAG envvar was not set. Did you try to test without make?")
@@ -433,6 +595,8 @@ func deployOperator(ctx context.Context, k8sClient client.Client, CPNamespace st
 	loggingSidecarImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, loggingSidecarImage, agentImageTag)
 	monitoringAgentImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, monitoringAgentImage, agentImageTag)
 	operatorImage := fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, operatorImage, agentImageTag)
+	// Global modified for usage in pitr test.
+	PitrAgentImage = fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, PitrAgentImage, agentImageTag)
 
 	objs, err := readYamls([]string{
 		"config/manager/manager.yaml",
@@ -566,7 +730,7 @@ func getOperatorLogs(ctx context.Context, config *rest.Config, namespace string)
 		return "", err
 	}
 
-	pod, err := findPodFor(ctx, clientSet, namespace, "control-plane=controller-manager")
+	pod, err := FindPodFor(ctx, clientSet, namespace, "control-plane=controller-manager")
 	if err != nil {
 		return "", err
 	}
@@ -579,12 +743,12 @@ func getAgentLogs(ctx context.Context, config *rest.Config, namespace, instance,
 	// with the instance.
 	agentToQuery := map[string]string{
 		// NCSA Agents
-		"oracle-monitoring": "deployment=" + instance + "-agent-deployment",
+		"oracle-monitoring": "instance=" + instance + ",task-type=" + controllers.MonitorTaskType,
 		// CSA Agents
-		"oracledb":             "instance=" + instance,
-		"dbdaemon":             "instance=" + instance,
-		"alert-log-sidecar":    "instance=" + instance,
-		"listener-log-sidecar": "instance=" + instance,
+		"oracledb":             "instance=" + instance + ",task-type=" + controllers.DatabaseTaskType,
+		"dbdaemon":             "instance=" + instance + ",task-type=" + controllers.DatabaseTaskType,
+		"alert-log-sidecar":    "instance=" + instance + ",task-type=" + controllers.DatabaseTaskType,
+		"listener-log-sidecar": "instance=" + instance + ",task-type=" + controllers.DatabaseTaskType,
 	}
 
 	clientSet, err := kubernetes.NewForConfig(config)
@@ -592,7 +756,7 @@ func getAgentLogs(ctx context.Context, config *rest.Config, namespace, instance,
 		return "", err
 	}
 
-	pod, err := findPodFor(ctx, clientSet, namespace, agentToQuery[agent])
+	pod, err := FindPodFor(ctx, clientSet, namespace, agentToQuery[agent])
 	if err != nil {
 		return "", err
 	}
@@ -617,7 +781,7 @@ func getContainerLogs(ctx context.Context, clientSet *kubernetes.Clientset, ns, 
 	return sb.String(), nil
 }
 
-func findPodFor(ctx context.Context, clientSet *kubernetes.Clientset, ns, filter string) (*corev1.Pod, error) {
+func FindPodFor(ctx context.Context, clientSet *kubernetes.Clientset, ns, filter string) (*corev1.Pod, error) {
 	listOpts := metav1.ListOptions{
 		LabelSelector: filter,
 	}
@@ -654,14 +818,20 @@ Example usage:
 var k8sEnv = testhelpers.K8sEnvironment{}
 // In case of Ctrl-C, clean up the last valid k8sEnv.
 AfterSuite(func() {
+
 	k8sEnv.Close()
+
 })
 ...
 BeforeEach(func() {
+
 	k8sEnv.Init(testhelpers.RandName("k8s-env-stress-test"))
+
 })
 AfterEach(func() {
+
 	k8sEnv.Close()
+
 })
 */
 type K8sOperatorEnvironment struct {
@@ -689,6 +859,7 @@ func (k8sEnv *K8sOperatorEnvironment) Init(CPNamespace string, DPNamespace strin
 	By("Deploying operator in " + CPNamespace)
 	// Deploy Operator, retry if necessary
 	Expect(retry.OnError(retry.DefaultBackoff, func(error) bool { return true }, func() error {
+		defer GinkgoRecover()
 		var err error
 		k8sEnv.OperCleanup, err = deployOperator(k8sEnv.Ctx, k8sEnv.K8sClient, k8sEnv.CPNamespace, k8sEnv.DPNamespace)
 		if err != nil {
@@ -732,9 +903,7 @@ func TestImageForVersion(version string, edition string, extra string) string {
 				{
 					switch extra {
 					default:
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_18_XE_SEEDED")
-						}
+						return os.Getenv("TEST_IMAGE_ORACLE_18_XE_SEEDED")
 					}
 				}
 			}
@@ -745,18 +914,16 @@ func TestImageForVersion(version string, edition string, extra string) string {
 			case "19.3":
 				{
 					switch extra {
-					case "32545013-unseeded":
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_UNSEEDED_32545013")
-						}
+					case "unseeded-32545013":
+						return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_UNSEEDED_32545013")
+					case "unseeded":
+						return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_UNSEEDED_32545013")
+					case "seeded-buggy":
+						return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_SEEDED_BUGGY")
 					case "ocr":
-						{
-							return os.Getenv("TEST_IMAGE_OCR_ORACLE_19_3_EE_UNSEEDED_29517242")
-						}
+						return os.Getenv("TEST_IMAGE_OCR_ORACLE_19_3_EE_UNSEEDED_29517242")
 					default:
-						{
-							return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_SEEDED")
-						}
+						return os.Getenv("TEST_IMAGE_ORACLE_19_3_EE_SEEDED")
 					}
 				}
 			}
@@ -790,7 +957,7 @@ func CreateSimpleInstance(k8sEnv K8sOperatorEnvironment, instanceName string, ve
 				},
 				DatabaseResources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
-						corev1.ResourceMemory: resource.MustParse("7Gi"),
+						corev1.ResourceMemory: resource.MustParse("9Gi"),
 					},
 				},
 				Images: map[string]string{
@@ -817,7 +984,7 @@ func CreateSimplePdbWithDbObj(k8sEnv K8sOperatorEnvironment, database *v1alpha1.
 	// Wait for the PDB to come online (UserReady = "SyncComplete").
 	emptyObj := &v1alpha1.Database{}
 	objectKey := client.ObjectKey{Namespace: k8sEnv.DPNamespace, Name: database.Name}
-	WaitForObjectConditionState(k8sEnv, objectKey, emptyObj, k8s.UserReady, metav1.ConditionTrue, k8s.SyncComplete, 7*time.Minute)
+	WaitForObjectConditionState(k8sEnv, objectKey, emptyObj, k8s.UserReady, metav1.ConditionTrue, k8s.SyncComplete, 7*time.Minute, k8s.FindConditionOrFailed)
 
 	// Open PDBs.
 	out := K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, "alter pluggable database all open;")
@@ -866,6 +1033,15 @@ commit;`
 	Expect(out).To(Equal(""))
 }
 
+// VerifySimpleDataRemapped checks that the test row in 'retest_table' exists.
+func VerifySimpleDataRemapped(k8sEnv K8sOperatorEnvironment) {
+	pod := "mydb-sts-0"
+	sql := `alter session set container=pdb1;
+alter session set current_schema=scott;
+select name from retest_table;`
+	Expect(K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, sql)).To(Equal("Hello World"))
+}
+
 // VerifySimpleData checks that the test row in 'pdb1' exists.
 func VerifySimpleData(k8sEnv K8sOperatorEnvironment) {
 	pod := "mydb-sts-0"
@@ -873,6 +1049,26 @@ func VerifySimpleData(k8sEnv K8sOperatorEnvironment) {
 alter session set current_schema=scott;
 select name from test_table;`
 	Expect(K8sExecuteSqlOrFail(pod, k8sEnv.DPNamespace, sql)).To(Equal("Hello World"))
+}
+
+// InsertData creates <table> in <pdb> and inserts <value>.
+func InsertData(pod, ns, pdb, user, table, value string) {
+	// Insert test data
+	sql := fmt.Sprintf(`alter session set container=%s;
+alter session set current_schema=%s;
+create table %s (name varchar(100));
+insert into %s values ('%s');
+commit;`, pdb, user, table, table, value)
+	out := K8sExecuteSqlOrFail(pod, ns, sql)
+	Expect(out).To(Equal(""))
+}
+
+// VerifyData checks that <value> in <pdb> exists.
+func VerifyData(pod, ns, pdb, user, table, value string) {
+	sql := fmt.Sprintf(`alter session set container=%s;
+alter session set current_schema=%s;
+select name from %s;`, pdb, user, table)
+	Expect(K8sExecuteSqlOrFail(pod, ns, sql)).To(Equal(value))
 }
 
 // WaitForObjectConditionState waits until the k8s object condition object status = targetStatus
@@ -885,26 +1081,27 @@ func WaitForObjectConditionState(k8sEnv K8sOperatorEnvironment,
 	condition string,
 	targetStatus metav1.ConditionStatus,
 	targetReason string,
-	timeout time.Duration) {
+	timeout time.Duration,
+	findConditionOrFailed func(conditions []metav1.Condition, name string) (bool, *metav1.Condition)) {
 	Eventually(func() bool {
 		K8sGetWithRetry(k8sEnv.K8sClient, k8sEnv.Ctx, key, emptyObj)
 		failed := false
 		cond := &metav1.Condition{}
 		switch emptyObj.(type) {
 		case *v1alpha1.Instance:
-			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Instance).Status.Conditions, condition)
+			failed, cond = findConditionOrFailed(emptyObj.(*v1alpha1.Instance).Status.Conditions, condition)
 		case *v1alpha1.Import:
-			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Import).Status.Conditions, condition)
+			failed, cond = findConditionOrFailed(emptyObj.(*v1alpha1.Import).Status.Conditions, condition)
 		case *v1alpha1.Export:
-			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Export).Status.Conditions, condition)
+			failed, cond = findConditionOrFailed(emptyObj.(*v1alpha1.Export).Status.Conditions, condition)
 		case *v1alpha1.Database:
-			failed, cond = k8s.FindConditionOrFailed(emptyObj.(*v1alpha1.Database).Status.Conditions, condition)
+			failed, cond = findConditionOrFailed(emptyObj.(*v1alpha1.Database).Status.Conditions, condition)
 		}
 		if cond != nil {
 			logf.FromContext(nil).Info(fmt.Sprintf("Waiting %v, status=%v:%v, expecting=%v:%v", condition, cond.Status, cond.Reason, targetStatus, targetReason))
 			done := cond.Status == targetStatus && cond.Reason == targetReason
 			if !done && failed { // Allow for expecting a "Failed" condition.
-				Fail(fmt.Sprintf("Failed %v, status=%v:%v, expecting=%v:%v", condition, cond.Status, cond.Reason, targetStatus, targetReason))
+				Fail(fmt.Sprintf("Failed %v, status=%v:%v message=%v, expecting=%v:%v", condition, cond.Status, cond.Reason, cond.Message, targetStatus, targetReason))
 			}
 			return done
 
@@ -917,7 +1114,63 @@ func WaitForObjectConditionState(k8sEnv K8sOperatorEnvironment,
 // Depends on the Ginkgo asserts.
 func WaitForInstanceConditionState(k8sEnv K8sOperatorEnvironment, key client.ObjectKey, condition string, targetStatus metav1.ConditionStatus, targetReason string, timeout time.Duration) {
 	instance := &v1alpha1.Instance{}
-	WaitForObjectConditionState(k8sEnv, key, instance, condition, targetStatus, targetReason, timeout)
+	WaitForObjectConditionState(k8sEnv, key, instance, condition, targetStatus, targetReason, timeout, k8s.FindConditionOrFailed)
+}
+
+// WaitForDatabaseConditionState waits until the Database condition object status = targetStatus and reason = targetReason.
+// Depends on the Ginkgo asserts.
+func WaitForDatabaseConditionState(k8sEnv K8sOperatorEnvironment, key client.ObjectKey, condition string, targetStatus metav1.ConditionStatus, targetReason string, timeout time.Duration) {
+	database := &v1alpha1.Database{}
+	WaitForObjectConditionState(k8sEnv, key, database, condition, targetStatus, targetReason, timeout, k8s.FindConditionOrFailed)
+}
+
+// K8sCopyFromPodOrFail copies file/dir in src path of the pod to local dest path.
+// Depends on kubectl
+// kubectl cp <pod>:<src> dest -n <ns> -c <container>
+func K8sCopyFromPodOrFail(pod, ns, container, src, dest string) {
+	cmd := exec.Command("kubectl", "cp", fmt.Sprintf("%s:%s", pod, src), dest, "-n", ns, "-c", container)
+	output, err := cmd.CombinedOutput()
+	logf.FromContext(nil).Info("k8s copy from pod", "cmd", cmd, "output", string(output), "err", err)
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// UploadFileOrFail uploads an object to GCS, it raises a ginkgo assert on failure.
+func UploadFileOrFail(localFile, bucket, object string) {
+	Expect(retry.OnError(retry.DefaultBackoff,
+		func(error) bool { return true },
+		func() error { return uploadFile(localFile, bucket, object) }),
+	).To(Succeed())
+
+}
+
+// uploadFile uploads an object to GCS.
+func uploadFile(localFile, bucket, object string) error {
+	ctx := context.Background()
+	c, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("storage.NewClient: %v", err)
+	}
+	defer c.Close()
+
+	// Open local file.
+	f, err := os.Open(localFile)
+	if err != nil {
+		return fmt.Errorf("os.Open: %v", err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Minute*5)
+	defer cancel()
+
+	// Upload an object with storage.Writer.
+	wc := c.Bucket(bucket).Object(object).NewWriter(ctx)
+	if _, err = io.Copy(wc, f); err != nil {
+		return fmt.Errorf("io.Copy: %v", err)
+	}
+	if err := wc.Close(); err != nil {
+		return fmt.Errorf("Writer.Close: %v", err)
+	}
+	return nil
 }
 
 // K8sExec execs a command in a pod and returns a string result.
@@ -1018,6 +1271,7 @@ EOF
 // Uses ginkgo asserts.
 
 const RetryTimeout = time.Second * 5
+const RetryLongTimeout = time.Minute * 5
 const RetryInterval = time.Second * 1
 
 // K8sCreateWithRetry calls k8s Create() with retry as k8s might require this in some cases (e.g. conflicts).
@@ -1034,6 +1288,14 @@ func K8sGetWithRetry(k8sClient client.Client, ctx context.Context, objKey client
 		func() error {
 			return k8sClient.Get(ctx, objKey, obj)
 		}, RetryTimeout, RetryInterval).Should(Succeed())
+}
+
+// K8sGetWithLongRetry calls k8s Get() with retry as k8s might require this in some cases (e.g. conflicts).
+func K8sGetWithLongRetry(k8sClient client.Client, ctx context.Context, objKey client.ObjectKey, obj client.Object) {
+	Eventually(
+		func() error {
+			return k8sClient.Get(ctx, objKey, obj)
+		}, RetryLongTimeout, RetryInterval).Should(Succeed())
 }
 
 // K8sDeleteWithRetryNoWait calls k8s Delete() with retry as k8s might require
@@ -1166,7 +1428,9 @@ func K8sWaitForUpdate(k8sClient client.Client,
 // k8s service account <projectId>.svc.id.goog[<NAMESPACE>/default]
 // and google service account.
 func SetupServiceAccountBindingBetweenGcpAndK8s(k8sEnv K8sOperatorEnvironment) {
-	Expect(retry.OnError(retry.DefaultBackoff, func(error) bool { return true }, func() error {
+	longerBackoff := retry.DefaultBackoff
+	longerBackoff.Steps = 6 // Try a couple more times as there is lots of contention
+	Expect(retry.OnError(longerBackoff, func(error) bool { return true }, func() error {
 		cmd := exec.Command("gcloud", "iam",
 			"service-accounts", "add-iam-policy-binding",
 			"--role=roles/iam.workloadIdentityUser",
@@ -1224,6 +1488,68 @@ func StoreOracleLogs(pod string, ns string, instanceName string, CDBName string)
 	}
 	logf.FromContext(nil).Info(fmt.Sprintf("Stored Oracle /trace/ to %s", storePath))
 	return nil
+}
+
+// Wrapper over exec.Command, prints the command line and the output.
+// Raises Ginkgo assert on failure.
+func execCommand(name string, arg ...string) {
+	out, err := exec.Command(name, arg...).CombinedOutput()
+	logf.FromContext(nil).Info(fmt.Sprintf("%s %s", name, strings.Join(arg, " ")), "output", string(out))
+	Expect(err).NotTo(HaveOccurred())
+}
+
+// Create a new set of agent images from existing adding -v2 to the name
+// Throw Ginkgo assert on failure.
+func CreateV1V2Images(k8sEnv K8sOperatorEnvironment) (map[string]string, map[string]string) {
+	agentImageRepo := os.Getenv("PROW_IMAGE_REPO")
+	Expect(agentImageRepo).NotTo(Equal(""))
+	agentImageTag := os.Getenv("PROW_IMAGE_TAG")
+	Expect(agentImageTag).NotTo(Equal(""))
+	tmpContainerName := fmt.Sprintf("temp_container_%s", k8sEnv.CPNamespace)
+	agentImageProject := os.Getenv("PROW_PROJECT")
+	Expect(agentImageProject).NotTo(Equal(""))
+
+	v1Images := map[string]string{
+		"dbinit":          fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, dbInitImage, agentImageTag),
+		"logging_sidecar": fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, loggingSidecarImage, agentImageTag),
+		"monitoring":      fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, monitoringAgentImage, agentImageTag),
+		"operator":        fmt.Sprintf("%s/%s/%s:%s", agentImageRepo, agentImageProject, operatorImage, agentImageTag),
+	}
+
+	v2Images := map[string]string{
+		"dbinit":          fmt.Sprintf("%s/%s/%s-v2:%s", agentImageRepo, agentImageProject, dbInitImage, agentImageTag),
+		"logging_sidecar": fmt.Sprintf("%s/%s/%s-v2:%s", agentImageRepo, agentImageProject, loggingSidecarImage, agentImageTag),
+		"monitoring":      fmt.Sprintf("%s/%s/%s-v2:%s", agentImageRepo, agentImageProject, monitoringAgentImage, agentImageTag),
+		"operator":        fmt.Sprintf("%s/%s/%s-v2:%s", agentImageRepo, agentImageProject, operatorImage, agentImageTag),
+	}
+
+	// Create a new file NEW_VERSION
+	f, err := os.Create("NEW_VERSION")
+	Expect(err).NotTo(HaveOccurred())
+	defer f.Close()
+
+	for k, v := range v1Images {
+		// Create a v2 copy of the image
+		// gcloud container images add-tag -q $IMAGE_URL_1 $IMAGE_URL_2
+		execCommand("gcloud", "container", "images", "add-tag", "-q", v, v2Images[k])
+
+		// Add /NEW_VERSION file to the image, upload it back
+
+		// docker pull $IMAGE_URL
+		execCommand("docker", "pull", v2Images[k])
+		// docker create --name temp_container $IMAGE_URL noop
+		execCommand("docker", "create", "--name", tmpContainerName, v2Images[k], "noop")
+		// docker cp NEW_VERSION temp_container:/NEW_VERSION
+		execCommand("docker", "cp", "NEW_VERSION", fmt.Sprintf("%s:/NEW_VERSION", tmpContainerName))
+		// docker commit temp_container $IMAGE_URL
+		execCommand("docker", "commit", tmpContainerName, v2Images[k])
+		// docker push $IMAGE_URL
+		execCommand("docker", "push", v2Images[k])
+		// docker rm temp_container
+		execCommand("docker", "rm", tmpContainerName)
+	}
+
+	return v1Images, v2Images
 }
 
 // Returns true if 'PROW_CANARY_JOB' env is set.

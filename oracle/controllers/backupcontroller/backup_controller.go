@@ -19,17 +19,20 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
@@ -44,6 +47,7 @@ var (
 	statusCheckInterval  = time.Minute
 	msgSep               = "; "
 	timeNow              = time.Now
+	reconcileTimeout     = 3 * time.Minute
 )
 
 // BackupReconciler reconciles a Backup object.
@@ -51,8 +55,9 @@ type BackupReconciler struct {
 	client.Client
 	Log                 logr.Logger
 	Scheme              *runtime.Scheme
-	OracleBackupFactory oracleBackupFactory
 	Recorder            record.EventRecorder
+	InstanceLocks       *sync.Map
+	OracleBackupFactory oracleBackupFactory
 	BackupCtrl          backupControl
 
 	DatabaseClientFactory controllers.DatabaseClientFactory
@@ -64,6 +69,7 @@ type backupControl interface {
 	GetInstance(name, namespace string) (*v1alpha1.Instance, error)
 	LoadConfig(namespace string) (*v1alpha1.Config, error)
 	UpdateStatus(obj client.Object) error
+	UpdateBackup(obj client.Object) error
 }
 
 // +kubebuilder:rbac:groups=oracle.db.anthosapis.com,resources=backups,verbs=get;list;watch;create;update;patch;delete
@@ -118,8 +124,9 @@ func (r *BackupReconciler) updateBackupStatus(ctx context.Context, backup *v1alp
 	return r.BackupCtrl.UpdateStatus(backup)
 }
 
-func (r *BackupReconciler) Reconcile(_ context.Context, req ctrl.Request) (result ctrl.Result, recErr error) {
-	ctx := context.Background()
+func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, recErr error) {
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
 	log := r.Log.WithValues("Backup", req.String())
 
 	log.Info("reconciling backup requests")
@@ -132,6 +139,10 @@ func (r *BackupReconciler) Reconcile(_ context.Context, req ctrl.Request) (resul
 
 	if backup.Spec.Mode == v1alpha1.VerifyExists {
 		return r.reconcileVerifyExists(ctx, backup, log)
+	}
+
+	if !backup.DeletionTimestamp.IsZero() {
+		return r.reconcileBackupDeletion(ctx, backup, log)
 	}
 
 	return r.reconcileBackupCreation(ctx, backup, log)
@@ -165,8 +176,8 @@ func (r *BackupReconciler) reconcileVerifyExists(ctx context.Context, backup *v1
 		errMsgs = append(errMsgs, fmt.Sprintf("%v backup does not support VerifyExists mode", backup.Spec.Type))
 	}
 
-	if backup.Spec.GcsPath == "" {
-		errMsgs = append(errMsgs, fmt.Sprintf(".spec.gcsPath must be specified, VerifyExists mode only support GCS based physical backup"))
+	if controllers.GetBackupGcsPath(backup) == "" {
+		errMsgs = append(errMsgs, fmt.Sprintf("Either .spec.gcsPath or .spec.gcsDir must be specified, VerifyExists mode only support GCS based physical backup"))
 	}
 
 	if len(errMsgs) > 0 {
@@ -253,6 +264,14 @@ func (r *BackupReconciler) reconcileBackupCreation(ctx context.Context, backup *
 			return ctrl.Result{RequeueAfter: requeueInterval}, r.updateBackupStatus(ctx, backup, inst)
 		}
 
+		if err := r.addBackupMetadata(ctx, backup, &oracleBackupMetadata{
+			incarnation:       inst.Status.CurrentDatabaseIncarnation,
+			parentIncarnation: inst.Status.LastDatabaseIncarnation,
+			databaseImage:     inst.Status.ActiveImages["service"],
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		if err := b.create(ctx); err != nil {
 			// default retry
 			return ctrl.Result{}, err
@@ -269,12 +288,26 @@ func (r *BackupReconciler) reconcileBackupCreation(ctx context.Context, backup *
 		// backup type is validated in validateBackupSpec
 		b := r.OracleBackupFactory.newOracleBackup(r, backup, inst, log)
 		done, err := b.status(ctx)
+		if err != nil && strings.Contains(err.Error(), "code = NotFound") {
+			// The backup was interrupted and the LRO is lost.
+			backup.Status.Conditions = k8s.Upsert(backup.Status.Conditions, k8s.Ready, v1.ConditionFalse, k8s.BackupFailed, "Backup interrupted")
+			return ctrl.Result{}, r.updateBackupStatus(ctx, backup, inst)
+		}
+
 		if done {
 			if err == nil {
 				r.Recorder.Eventf(backup, corev1.EventTypeNormal, "BackupCompleted", "BackupId:%v, Elapsed time: %v", backup.Status.BackupID, k8s.ElapsedTimeFromLastTransitionTime(k8s.FindCondition(backup.Status.Conditions, k8s.Ready), time.Second))
+				backupMetadata, err := b.metadata(ctx)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.addBackupMetadata(ctx, backup, backupMetadata); err != nil {
+					return ctrl.Result{}, err
+				}
 				backup.Status.Conditions = k8s.Upsert(backup.Status.Conditions, k8s.Ready, v1.ConditionTrue, k8s.BackupReady, "")
 				duration := metav1.Duration{Duration: metav1.Now().Sub(backup.Status.StartTime.Time)}
 				backup.Status.Duration = &duration
+				backup.Status.GcsPath = controllers.GetBackupGcsPath(backup)
 				log.Info("reconcileBackupCreation: BackupInProgress->BackupReady")
 			} else {
 				r.Recorder.Event(backup, corev1.EventTypeWarning, "BackupFailed", err.Error())
@@ -287,11 +320,71 @@ func (r *BackupReconciler) reconcileBackupCreation(ctx context.Context, backup *
 		}
 		log.Info("reconciling backup creation: InProgress")
 		return ctrl.Result{RequeueAfter: statusCheckInterval}, nil
-
+	case k8s.BackupReady:
+		// Add finalizer to clean backup data in case of deletion.
+		if !controllerutil.ContainsFinalizer(backup, controllers.FinalizerName) {
+			log.Info("Adding backup finalizer.")
+			controllerutil.AddFinalizer(backup, controllers.FinalizerName)
+			// Immediately return to update the object and do the rest of work in the next reconcile cycle.
+			return ctrl.Result{}, r.Update(ctx, backup)
+		}
+		return ctrl.Result{}, nil
 	default:
 		log.Info("no action needed", "backupReady", backupReadyCond)
 		return ctrl.Result{}, nil
 	}
+}
+
+// reconcileBackupDeletion cleanup backup data when backup object is deleted.
+func (r *BackupReconciler) reconcileBackupDeletion(ctx context.Context, backup *v1alpha1.Backup, log logr.Logger) (ctrl.Result, error) {
+	log.Info("Reconciling backup delete...")
+
+	if !controllerutil.ContainsFinalizer(backup, controllers.FinalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	if backup.Status.Phase != k8s.BackupDeleting {
+		backup.Status.Conditions = k8s.Upsert(backup.Status.Conditions, k8s.Ready, v1.ConditionFalse, k8s.BackupDeleting, "Backup delete in progress.")
+		backup.Status.Phase = k8s.BackupDeleting
+		// return to make the update taking effect immediately.
+		return ctrl.Result{}, r.Status().Update(ctx, backup)
+	}
+
+	// Remove the backup finalizer if an associated Instance doesn't exist.
+	_, err := r.BackupCtrl.GetInstance(backup.Spec.Instance, backup.Namespace)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+		log.Info("Parent Instance not found. Removing backup finalizer.")
+		controllerutil.RemoveFinalizer(backup, controllers.FinalizerName)
+		return ctrl.Result{}, r.Update(ctx, backup)
+	}
+
+	var b oracleBackup
+	if backup.Spec.Type == commonv1alpha1.BackupTypeSnapshot {
+		b = &snapshotBackup{
+			r:      r,
+			log:    log,
+			backup: backup,
+		}
+	} else {
+		b = &physicalBackup{
+			r:      r,
+			log:    log,
+			backup: backup,
+		}
+	}
+
+	if err := b.delete(ctx); err != nil {
+		log.Error(err, "error delete backup", "error", err)
+		return ctrl.Result{}, fmt.Errorf("error deleting backup - %v", err)
+	}
+
+	// Remove the finalizer.
+	log.Info("Removing backup finalizer.")
+	controllerutil.RemoveFinalizer(backup, controllers.FinalizerName)
+	return ctrl.Result{}, r.Update(ctx, backup)
 }
 
 // instReady returns non-nil error if instance is not in ready state.
@@ -310,4 +403,33 @@ func (r *BackupReconciler) instReady(ctx context.Context, ns, instName string) (
 
 func lroOperationID(backup *v1alpha1.Backup) string {
 	return fmt.Sprintf("Backup_%s", backup.GetUID())
+}
+
+// addBackupMetadata adds non-zero metadata to backup's annotation/label.
+func (r *BackupReconciler) addBackupMetadata(ctx context.Context, backup *v1alpha1.Backup, backupMetadata *oracleBackupMetadata) error {
+	if backupMetadata == nil {
+		return nil
+	}
+	if backup.Labels == nil {
+		backup.Labels = map[string]string{}
+	}
+	if backup.Annotations == nil {
+		backup.Annotations = map[string]string{}
+	}
+	if !backupMetadata.timestamp.IsZero() {
+		backup.Annotations[controllers.TimestampAnnotation] = backupMetadata.timestamp.Format(time.RFC3339)
+	}
+	if backupMetadata.incarnation != "" {
+		backup.Labels[controllers.IncarnationLabel] = backupMetadata.incarnation
+	}
+	if backupMetadata.parentIncarnation != "" {
+		backup.Labels[controllers.ParentIncarnationLabel] = backupMetadata.parentIncarnation
+	}
+	if backupMetadata.scn != "" {
+		backup.Annotations[controllers.SCNAnnotation] = backupMetadata.scn
+	}
+	if backupMetadata.databaseImage != "" {
+		backup.Annotations[controllers.DatabaseImageAnnotation] = backupMetadata.databaseImage
+	}
+	return r.BackupCtrl.UpdateBackup(backup)
 }

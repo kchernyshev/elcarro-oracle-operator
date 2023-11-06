@@ -17,9 +17,13 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s/ownerref"
 	"github.com/go-logr/logr"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -40,14 +44,22 @@ import (
 const (
 	configAgentName = "config-agent"
 	// OperatorName is the default operator name.
-	OperatorName                = "operator"
-	scriptDir                   = "/agents"
-	defaultUID                  = int64(54321)
-	defaultGID                  = int64(54322)
+	OperatorName = "operator"
+	scriptDir    = "/agents"
+	// DefaultUID is the default Database pod user uid.
+	DefaultUID = int64(54321)
+	// DefaultGID is the default Database pod user gid.
+	DefaultGID                  = int64(54322)
 	safeMinMemoryForDBContainer = "4.0Gi"
+	podInfoMemRequestSubPath    = "request_memory"
+	dbContainerName             = "oracledb"
+	podInfoVolume               = "podinfo"
+	StoppedReplicaCnt           = 0
+	DefaultReplicaCnt           = 1
 )
 
 var (
+	podInfoDir      = "/etc/podinfo"
 	defaultDiskSize = resource.MustParse("100Gi")
 	dialTimeout     = 3 * time.Minute
 	configList      = []string{configAgentName, OperatorName}
@@ -152,7 +164,7 @@ func NewConfigMap(inst *v1alpha1.Instance, scheme *runtime.Scheme, cmName string
 
 // NewSts returns the statefulset for the database pod.
 func NewSts(sp StsParams, pvcs []corev1.PersistentVolumeClaim, podTemplate corev1.PodTemplateSpec) (*appsv1.StatefulSet, error) {
-	var replicas int32 = 1
+	var replicas int32 = DefaultReplicaCnt
 	sts := &appsv1.StatefulSet{
 		// It looks like the version needs to be explicitly set to avoid the
 		// "incorrect version specified in apply patch" error.
@@ -197,54 +209,45 @@ func GetLogLevelArgs(config *v1alpha1.Config) map[string][]string {
 	return agentArgs
 }
 
-// NewAgentDeployment returns the agent deployment.
-func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployment, error) {
-	var replicas int32 = 1
-	instlabels := map[string]string{"instance": agentDeployment.Inst.Name}
-	labels := map[string]string{"instance-agent": fmt.Sprintf("%s-agent", agentDeployment.Inst.Name), "deployment": agentDeployment.Name}
-
-	monitoringAgentArgs := []string{
-		fmt.Sprintf("--dbservice=%s", fmt.Sprintf(DbdaemonSvcName, agentDeployment.Inst.Name)),
-		fmt.Sprintf("--dbport=%d", consts.DefaultDBDaemonPort),
+func MonitoringPodTemplate(inst *v1alpha1.Instance, monitoringSecret *corev1.Secret, images map[string]string) corev1.PodTemplateSpec {
+	svcName := fmt.Sprintf(SvcName, inst.Name)
+	dbdName := GetDBDomain(inst)
+	names := []string{inst.Spec.CDBName}
+	if dbdName != "" {
+		names = append(names, dbdName)
 	}
+	falseVal := false
 
-	// Kind cluster can only use local images
-	imagePullPolicy := corev1.PullAlways
-	if agentDeployment.Config != nil && agentDeployment.Config.Spec.Platform == utils.PlatformKind {
-		imagePullPolicy = corev1.PullIfNotPresent
-	}
-
-	var containers []corev1.Container
-
-	agentDeployment.Log.V(2).Info("enabling services: ", "services", agentDeployment.Services)
-	for _, s := range agentDeployment.Services {
-		switch s {
-		case commonv1alpha1.Monitoring:
-			containers = append(containers, corev1.Container{
-				Name:    consts.MonitoringAgentName,
-				Image:   agentDeployment.Images["monitoring"],
-				Command: []string{"/monitoring_agent"},
-				Args:    monitoringAgentArgs,
-				Ports: []corev1.ContainerPort{
-					{
-						Name:          "oe-port",
-						Protocol:      "TCP",
-						ContainerPort: consts.DefaultMonitoringAgentPort,
-					},
-				},
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: &agentDeployment.PrivEscalation,
-				},
-				ImagePullPolicy: imagePullPolicy,
-			})
-		default:
-			agentDeployment.Log.V(2).Info("unsupported service: ", "service", s)
-		}
-	}
-
-	if len(containers) == 0 {
-		return nil, nil
-	}
+	containers := []corev1.Container{{
+		Name:  "monitor",
+		Image: images["monitoring"], // TODO: Use constant
+		Env: []corev1.EnvVar{
+			{
+				Name:  "DATA_SOURCE_URI",
+				Value: fmt.Sprintf("oracle://%s:%d/%s", svcName, consts.SecureListenerPort, strings.Join(names, ".")),
+			},
+			{
+				Name:  "DATA_SOURCE_USER_FILE",
+				Value: "/mon-creds/username",
+			},
+			{
+				Name:  "DATA_SOURCE_PASS_FILE",
+				Value: "/mon-creds/password",
+			},
+		},
+		// TODO: Standardize metrics port.
+		Ports: []corev1.ContainerPort{
+			{ContainerPort: 9187, Protocol: corev1.ProtocolTCP},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &falseVal,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
+		},
+		ImagePullPolicy: corev1.PullAlways,
+		VolumeMounts: []corev1.VolumeMount{
+			{MountPath: "/mon-creds/", Name: "mon-creds"},
+		},
+	}}
 
 	podSpec := corev1.PodSpec{
 		SecurityContext: &corev1.PodSecurityContext{},
@@ -257,43 +260,39 @@ func NewAgentDeployment(agentDeployment AgentDeploymentParams) (*appsv1.Deployme
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
 					{
 						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: instlabels,
+							MatchLabels: map[string]string{
+								"instance":  inst.Name,
+								"task-type": DatabaseTaskType,
+							},
 						},
-						Namespaces:  []string{agentDeployment.Inst.Namespace},
+						Namespaces:  []string{inst.Namespace},
 						TopologyKey: "kubernetes.io/hostname",
 					},
 				},
 			},
 		},
+		Volumes: []corev1.Volume{{
+			Name: "mon-creds",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: monitoringSecret.Name,
+				},
+			},
+		}},
 	}
 
 	template := corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:    labels,
-			Namespace: agentDeployment.Inst.Namespace,
+			Namespace: inst.Namespace,
+			// Inform prometheus/opentel that we report metrics.
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+			},
 		},
 		Spec: podSpec,
 	}
 
-	deployment := &appsv1.Deployment{
-		// It looks like the version needs to be explicitly set to avoid the
-		// "incorrect version specified in apply patch" error.
-		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
-		ObjectMeta: metav1.ObjectMeta{Name: agentDeployment.Name, Namespace: agentDeployment.Inst.Namespace},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: template,
-		},
-	}
-
-	if err := ctrl.SetControllerReference(agentDeployment.Inst, deployment, agentDeployment.Scheme); err != nil {
-		return deployment, err
-	}
-
-	return deployment, nil
+	return template
 }
 
 // NewPVCs returns PVCs.
@@ -305,7 +304,7 @@ func NewPVCs(sp StsParams) ([]corev1.PersistentVolumeClaim, error) {
 		if sp.Config != nil {
 			configSpec = &sp.Config.Spec.ConfigSpec
 		}
-		rl := corev1.ResourceList{corev1.ResourceStorage: utils.FindDiskSize(&diskSpec, configSpec, defaultDiskSpecs, defaultDiskSize)}
+		rl := corev1.ResourceList{corev1.ResourceStorage: utils.FindDiskSize(&diskSpec, configSpec, DefaultDiskSpecs, defaultDiskSize)}
 		pvcName, mount := GetPVCNameAndMount(sp.Inst.Name, diskSpec.Name)
 		var pvc corev1.PersistentVolumeClaim
 
@@ -321,12 +320,22 @@ func NewPVCs(sp StsParams) ([]corev1.PersistentVolumeClaim, error) {
 			pvcAnnotations = diskSpec.Annotations
 		}
 
+		var ownerRef []metav1.OwnerReference
+		if !sp.Inst.Spec.RetainDisksAfterInstanceDeletion {
+			// Instead of manually handling PVCs after an instance is deleted,
+			// we leverage ownerRef to automatically delete PVCs if necessary.
+			ownerRef = []metav1.OwnerReference{
+				ownerref.New(sp.Inst, true, true),
+			}
+		}
+
 		pvc = corev1.PersistentVolumeClaim{
 			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:        pvcName,
-				Namespace:   sp.Inst.Namespace,
-				Annotations: pvcAnnotations,
+				Name:            pvcName,
+				Namespace:       sp.Inst.Namespace,
+				Annotations:     pvcAnnotations,
+				OwnerReferences: ownerRef,
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes:      []corev1.PersistentVolumeAccessMode{"ReadWriteOnce"},
@@ -367,11 +376,13 @@ func buildPVCMounts(sp StsParams) []corev1.VolumeMount {
 }
 
 // NewPodTemplate returns the pod template for the database statefulset.
-func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSpec {
+func NewPodTemplate(sp StsParams, inst v1alpha1.Instance) corev1.PodTemplateSpec {
+	cdbName := inst.Spec.CDBName
+	DBDomain := GetDBDomain(&inst)
 	labels := map[string]string{
 		"instance":    sp.Inst.Name,
 		"statefulset": sp.StsName,
-		"app":         DatabasePodAppLabel,
+		"task-type":   DatabaseTaskType,
 	}
 
 	// Set default safeguard memory if the database resource is not specified.
@@ -390,12 +401,12 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 		imagePullPolicy = corev1.PullIfNotPresent
 	}
 
-	sp.Log.Info("NewPodTemplate: creating new template with service image", "image", sp.Images["service"])
+	sp.Log.Info("NewPodTemplate: creating new template with images", "images", sp.Images)
 	dataDiskPVC, dataDiskMountName := GetPVCNameAndMount(sp.Inst.Name, "DataDisk")
 
 	containers := []corev1.Container{
 		{
-			Name:      "oracledb",
+			Name:      dbContainerName,
 			Resources: dbResource,
 			Image:     sp.Images["service"],
 			Command:   []string{fmt.Sprintf("%s/init_container.sh", scriptDir)},
@@ -417,10 +428,12 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			VolumeMounts: append([]corev1.VolumeMount{
 				{Name: "var-tmp", MountPath: "/var/tmp"},
 				{Name: "agent-repo", MountPath: "/agents"},
+				{Name: podInfoVolume, MountPath: podInfoDir, ReadOnly: true},
 			},
 				buildPVCMounts(sp)...),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &sp.PrivEscalation,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 			},
 			EnvFrom: []corev1.EnvFromSource{
 				{
@@ -439,10 +452,12 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &sp.PrivEscalation,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 			},
 			VolumeMounts: append([]corev1.VolumeMount{
 				{Name: "var-tmp", MountPath: "/var/tmp"},
 				{Name: "agent-repo", MountPath: "/agents"},
+				{Name: podInfoVolume, MountPath: podInfoDir},
 			},
 				buildPVCMounts(sp)...),
 			ImagePullPolicy: imagePullPolicy,
@@ -454,9 +469,11 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			Args:    []string{"--logType=ALERT"},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &sp.PrivEscalation,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 			},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: dataDiskPVC, MountPath: fmt.Sprintf("/%s", dataDiskMountName)},
+				{Name: podInfoVolume, MountPath: podInfoDir, ReadOnly: true},
 			},
 			ImagePullPolicy: imagePullPolicy,
 		},
@@ -467,9 +484,11 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			Args:    []string{"--logType=LISTENER"},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &sp.PrivEscalation,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 			},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: dataDiskPVC, MountPath: fmt.Sprintf("/%s", dataDiskMountName)},
+				{Name: podInfoVolume, MountPath: podInfoDir, ReadOnly: true},
 			},
 			ImagePullPolicy: imagePullPolicy,
 		},
@@ -481,6 +500,7 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			Command: []string{"sh", "-c", "cp -r agent_repo/. /agents/ && chmod -R 750 /agents/*"},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: &sp.PrivEscalation,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 			},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "agent-repo", MountPath: "/agents"},
@@ -498,25 +518,34 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			Name:         "agent-repo",
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		},
-	}
-
-	var antiAffinityNamespaces []string
-	if sp.Config != nil && len(sp.Config.Spec.HostAntiAffinityNamespaces) != 0 {
-		antiAffinityNamespaces = sp.Config.Spec.HostAntiAffinityNamespaces
+		{
+			Name: podInfoVolume,
+			VolumeSource: corev1.VolumeSource{DownwardAPI: &corev1.DownwardAPIVolumeSource{
+				Items: []corev1.DownwardAPIVolumeFile{{
+					Path: podInfoMemRequestSubPath,
+					ResourceFieldRef: &corev1.ResourceFieldSelector{
+						ContainerName: dbContainerName,
+						Resource:      "requests.memory",
+						Divisor:       resource.MustParse("1Mi"),
+					},
+				},
+				},
+			}},
+		},
 	}
 
 	uid := sp.Inst.Spec.DatabaseUID
 	if uid == nil {
-		sp.Log.Info("set pod user ID to default value", "UID", defaultUID)
+		sp.Log.Info("set pod user ID to default value", "UID", DefaultUID)
 		// consts are not addressable
-		uid = func(i int64) *int64 { return &i }(defaultUID)
+		uid = func(i int64) *int64 { return &i }(DefaultUID)
 	}
 
 	gid := sp.Inst.Spec.DatabaseGID
 	if gid == nil {
-		sp.Log.Info("set pod group ID to default value", "GID", defaultGID)
+		sp.Log.Info("set pod group ID to default value", "GID", DefaultGID)
 		// consts are not addressable
-		gid = func(i int64) *int64 { return &i }(defaultGID)
+		gid = func(i int64) *int64 { return &i }(DefaultGID)
 	}
 
 	// for minikube/kind, the default csi-hostpath-driver mounts persistent volumes writable by root only, so explicitly
@@ -533,30 +562,17 @@ func NewPodTemplate(sp StsParams, cdbName, DBDomain string) corev1.PodTemplateSp
 			RunAsNonRoot: func(b bool) *bool { return &b }(true),
 		},
 		// ImagePullSecrets: []corev1.LocalObjectReference {{Name: GcrSecretName }},
-		// InitContainers: initContainers,
 		Containers:            containers,
 		InitContainers:        initContainers,
 		ShareProcessNamespace: func(b bool) *bool { return &b }(true),
 		// ServiceAccountName:
 		// TerminationGracePeriodSeconds:
-		// Tolerations:
-		Volumes: volumes,
-		Affinity: &corev1.Affinity{
-			PodAntiAffinity: &corev1.PodAntiAffinity{
-				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
-					{
-						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"app": DatabasePodAppLabel},
-						},
-						Namespaces:  antiAffinityNamespaces,
-						TopologyKey: "kubernetes.io/hostname",
-					},
-				},
-			},
-		},
+		Tolerations: inst.Spec.PodSpec.Tolerations,
+		Volumes:     volumes,
+		Affinity:    inst.Spec.PodSpec.Affinity,
 	}
 
-	// TODO(bdali): consider adding pod affinity, priority class name, secret mount.
+	// TODO(bdali): consider adding priority class name, secret mount.
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -643,6 +659,7 @@ func addHostpathInitContainer(sp StsParams, containers []corev1.Container, uid, 
 			RunAsGroup:               func(i int64) *int64 { return &i }(0),
 			RunAsNonRoot:             func(b bool) *bool { return &b }(false),
 			AllowPrivilegeEscalation: &sp.PrivEscalation,
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"NET_RAW"}},
 		},
 		VolumeMounts: volumeMounts,
 	})
@@ -656,4 +673,19 @@ func DiskSpecs(inst *v1alpha1.Instance, config *v1alpha1.Config) []commonv1alpha
 		return config.Spec.Disks
 	}
 	return defaultDisks
+}
+
+func RequestedMemoryInMi() (int, error) {
+	p := filepath.Join(podInfoDir, podInfoMemRequestSubPath)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to open file [%v], error: %v", p, err)
+	} else {
+		s := string(b)
+		if i, err := strconv.Atoi(s); err != nil {
+			return 0, fmt.Errorf("Failed to convert [%v] to int, error: %w", s, err)
+		} else {
+			return i, nil
+		}
+	}
 }

@@ -15,26 +15,32 @@
 package controllers
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/standbyhelpers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/backup"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/common/sql"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/consts"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/standby"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/database/provision"
-	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/util/secret"
 	lropb "google.golang.org/genproto/googleapis/longrunning"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
 )
 
 const (
@@ -52,6 +58,10 @@ var (
 		return client, client.Close, nil
 	}
 )
+
+var overrideParamTypeStatic = map[string]bool{
+	"sga_target": true,
+}
 
 // GetLROOperation returns LRO operation for the specified namespace instance and operation id.
 func GetLROOperation(ctx context.Context, dbClientFactory DatabaseClientFactory, r client.Reader, id, namespace, instName string) (*lropb.Operation, error) {
@@ -161,7 +171,7 @@ func BounceDatabase(ctx context.Context, r client.Reader, dbClientFactory Databa
 	}
 	defer closeConn()
 
-	klog.InfoS("config_agent_helpers/BounceDatabase", "client", dbClient)
+	klog.InfoS("config_agent_helpers/BounceDatabase shutting down database")
 	_, err = dbClient.BounceDatabase(ctx, &dbdpb.BounceDatabaseRequest{
 		Operation:    dbdpb.BounceDatabaseRequest_SHUTDOWN,
 		DatabaseName: req.Sid,
@@ -247,7 +257,7 @@ func CreateDatabase(ctx context.Context, r client.Reader, dbClientFactory Databa
 		return "", fmt.Errorf("config_agent_helpers/CreateDatabase: failed to create database daemon dbdClient: %v", err)
 	}
 	defer closeConn()
-	klog.InfoS("config_agent_helpers/CreateDatabase", "dbClient", dbClient)
+	klog.InfoS("config_agent_helpers/CreateDatabase: checking CDB state")
 
 	_, err = dbClient.CheckDatabaseState(ctx, &dbdpb.CheckDatabaseStateRequest{IsCdb: true, DatabaseName: req.CdbName, DbDomain: req.DbDomain})
 	if err != nil {
@@ -267,6 +277,7 @@ func CreateDatabase(ctx context.Context, r client.Reader, dbClientFactory Databa
 			sqls := append([]string{sql.QuerySetSessionContainer(p.pluggableDatabaseName)}, []string{sql.QueryAlterUser(pdbAdmin, pwd)}...)
 			if _, err := dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
 				Commands: sqls,
+				Suppress: true,
 			}); err != nil {
 				return "", fmt.Errorf("failed to alter user %s: %v", pdbAdmin, err)
 			}
@@ -305,7 +316,10 @@ func CreateDatabase(ctx context.Context, r client.Reader, dbClientFactory Databa
 	}
 	klog.InfoS("config_agent_helpers/CreateDatabase create a PDB Done", "pdb", p.pluggableDatabaseName)
 
-	pdbOpen := []string{fmt.Sprintf("alter pluggable database %s open read write", sql.MustBeObjectName(p.pluggableDatabaseName))}
+	pdbOpen := []string{
+		fmt.Sprintf("alter pluggable database %s open read write", sql.MustBeObjectName(p.pluggableDatabaseName)),
+		fmt.Sprintf("alter pluggable database %s save state", sql.MustBeObjectName(p.pluggableDatabaseName)),
+	}
 	_, err = dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: pdbOpen, Suppress: false})
 	if err != nil {
 		return "", fmt.Errorf("config_agent_helpers/CreatePDBDatabase: PDB %s open failed: %v", p.pluggableDatabaseName, err)
@@ -335,6 +349,49 @@ func CreateDatabase(ctx context.Context, r client.Reader, dbClientFactory Databa
 	klog.InfoS("config_agent_helpers/CreateDatabase: DONE", "pdb", p.pluggableDatabaseName)
 
 	return "Ready", nil
+}
+
+type DeleteDatabaseRequest struct {
+	Name     string
+	DbDomain string
+}
+
+// DeleteDatabase deletes the specified Database(PDB)
+func DeleteDatabase(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req DeleteDatabaseRequest) error {
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/CreateDatabase: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	pdbName := strings.ToUpper(req.Name)
+
+	pdbCheckCmd := []string{fmt.Sprintf("select open_mode, restricted from v$pdbs where name = '%s'", sql.StringParam(pdbName))}
+	resp, err := dbClient.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: pdbCheckCmd, Suppress: false})
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/DeleteDatabase: failed to check if a PDB named %s already exists: %v", pdbName, err)
+	}
+
+	if resp != nil && resp.Msg != nil {
+		klog.InfoS("config_agent_helpers/DeleteDatabase completed pre-flight check. The PDB exists.", "pdb", pdbName, "resp", resp)
+	} else {
+		klog.InfoS(fmt.Sprintf("config_agent_helpers/DeleteDatabase: A PDB named %s was not found", pdbName))
+		return nil
+	}
+
+	closePdbCmd := []string{fmt.Sprintf("alter pluggable database %s close immediate", sql.StringParam(pdbName))}
+	_, err = dbClient.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: closePdbCmd, Suppress: false})
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/DeleteDatabase: failed to close the PDB named %s: %v", pdbName, err)
+	}
+
+	deletePdbCmd := []string{fmt.Sprintf("drop pluggable database %s including datafiles", sql.StringParam(pdbName))}
+	_, err = dbClient.RunSQLPlusFormatted(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: deletePdbCmd, Suppress: false})
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/DeleteDatabase: failed to delete the PDB named %s: %v", pdbName, err)
+	}
+
+	return nil
 }
 
 type UsersChangedRequest struct {
@@ -441,7 +498,7 @@ func UpdateUsers(ctx context.Context, r client.Reader, dbClientFactory DatabaseC
 	}
 
 	for _, u := range toUpdatePwd {
-		klog.InfoS("config_agent_helpers/UpdateUsers", "updating user", u.userName)
+		klog.InfoS("config_agent_helpers/UpdateUsers", "updating user pwd", u.userName)
 		if err := u.updatePassword(ctx, dbClient); err != nil {
 			klog.ErrorS(err, "failed to update user password")
 			foundErr = true
@@ -485,10 +542,13 @@ func SetParameter(ctx context.Context, dbClientFactory DatabaseClientFactory, r 
 	}
 
 	isStatic := false
-	if paramType == "FALSE" {
+	if paramType == "FALSE" || overrideParamTypeStatic[key] {
 		klog.InfoS("config_agent_helpers/SetParameter", "parameter_type", "STATIC")
 		command = fmt.Sprintf("%s scope=spfile", command)
 		isStatic = true
+	}
+	if paramType == "DEFERRED" {
+		command = fmt.Sprintf("%s deferred", command)
 	}
 
 	_, err = dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{
@@ -512,6 +572,9 @@ func fetchAndParseSingleResultQuery(ctx context.Context, client dbdpb.DatabaseDa
 	response, err := client.RunSQLPlusFormatted(ctx, sqlRequest)
 	if err != nil {
 		return "", fmt.Errorf("failed to run query %q; DSN: %q; error: %v", query, sqlRequest.GetDsn(), err)
+	}
+	if response == nil {
+		return "", nil
 	}
 	result, err := parseSQLResponse(response)
 	if err != nil {
@@ -635,7 +698,7 @@ func CreateUsers(ctx context.Context, r client.Reader, dbClientFactory DatabaseC
 		return "", fmt.Errorf("config_agent_helpers/CreateUsers: failed to create database daemon client: %v", err)
 	}
 	defer closeConn()
-	klog.InfoS("config_agent_helpers/CreateUsers", "client", dbClient)
+	klog.InfoS("config_agent_helpers/CreateUsers: checking CDB state")
 
 	_, err = dbClient.CheckDatabaseState(ctx, &dbdpb.CheckDatabaseStateRequest{IsCdb: true, DatabaseName: req.CdbName, DbDomain: req.DbDomain})
 	if err != nil {
@@ -660,7 +723,7 @@ func CreateUsers(ctx context.Context, r client.Reader, dbClientFactory DatabaseC
 			usersCmd = append(usersCmd, sql.QueryCreateUser(u.Name, pwd))
 		}
 	}
-	_, err = dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: usersCmd, Suppress: false})
+	_, err = dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: usersCmd, Suppress: true})
 	if err != nil {
 		return "", fmt.Errorf("config_agent_helpers/CreateUsers: failed to create users in a PDB %s: %v", p.pluggableDatabaseName, err)
 	}
@@ -804,48 +867,11 @@ func BootstrapStandby(ctx context.Context, r client.Reader, dbClientFactory Data
 		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: failed to create database daemon client: %v", err)
 	}
 	defer closeConn()
-	klog.InfoS("config_agent_helpers/CreateUsers", "client", dbClient)
-
-	// skip if already bootstrapped
-	resp, err := dbClient.FileExists(ctx, &dbdpb.FileExistsRequest{Name: consts.ProvisioningDoneFile})
-	if err != nil {
-		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: failed to check a provisioning file: %v", err)
-	}
-
-	if resp.Exists {
-		klog.InfoS("config_agent_helpers/BootstrapStandby: standby is already provisioned")
-		return nil, nil
-	}
-
-	task := provision.NewBootstrapDatabaseTaskForStandby(req.CdbName, req.Dbdomain, dbClient)
-
-	if err := task.Call(ctx); err != nil {
+	klog.InfoS("BootstrapStandby running")
+	if err := standby.BootstrapStandby(ctx, dbClient); err != nil {
 		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: failed to bootstrap standby database : %v", err)
 	}
 	klog.InfoS("config_agent_helpers/BootstrapStandby: bootstrap task completed successfully")
-
-	// create listeners
-	err = CreateListener(ctx, r, dbClientFactory, namespace, instName, &CreateListenerRequest{
-		Name:     req.CdbName,
-		Port:     consts.SecureListenerPort,
-		Protocol: "TCP",
-		DbDomain: req.Dbdomain,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: failed to create listener: %v", err)
-	}
-
-	if _, err := dbClient.BootstrapStandby(ctx, &dbdpb.BootstrapStandbyRequest{
-		CdbName: req.CdbName,
-	}); err != nil {
-		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: dbdaemon failed to bootstrap standby: %v", err)
-	}
-	klog.InfoS("config_agent_helpers/BootstrapStandby: dbdaemon completed bootstrap standby successfully")
-
-	_, err = dbClient.RunSQLPlus(ctx, &dbdpb.RunSQLPlusCMDRequest{Commands: []string{consts.OpenPluggableDatabaseSQL}, Suppress: false})
-	if err != nil {
-		return nil, fmt.Errorf("config_agent_helpers/BootstrapStandby: failed to open pluggable database: %v", err)
-	}
 
 	// fetch existing pdbs/users to create database resources for
 	knownPDBsResp, err := dbClient.KnownPDBs(ctx, &dbdpb.KnownPDBsRequest{
@@ -896,7 +922,7 @@ func CreateListener(ctx context.Context, r client.Reader, dbClientFactory Databa
 		return fmt.Errorf("config_agent_helpers/CreateListener: failed to create listener: %v", err)
 	}
 	defer closeConn()
-	klog.InfoS("config_agent_helpers/CreateListener", "dbClient", dbClient)
+	klog.InfoS("config_agent_helpers/CreateListener: creating listener")
 
 	_, err = dbClient.CreateListener(ctx, &dbdpb.CreateListenerRequest{
 		DatabaseName: req.Name,
@@ -950,6 +976,7 @@ type PhysicalBackupRequest struct {
 	LocalPath   string
 	GcsPath     string
 	LroInput    *LROInput
+	BackupTag   string
 }
 
 type PhysicalBackupRequest_Type int32
@@ -993,7 +1020,7 @@ func PhysicalBackup(ctx context.Context, r client.Reader, dbClientFactory Databa
 		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackup: failed to create database daemon client: %v", err)
 	}
 	defer closeConn()
-	klog.InfoS("config_agent_helpers/PhysicalBackup", "dbClient", dbClient)
+	klog.InfoS("config_agent_helpers/PhysicalBackup: creating physical backup")
 
 	sectionSize := resource.NewQuantity(int64(req.SectionSize), resource.DecimalSI)
 	return backup.PhysicalBackup(ctx, &backup.Params{
@@ -1008,6 +1035,7 @@ func PhysicalBackup(ctx context.Context, r client.Reader, dbClientFactory Databa
 		SectionSize:  *sectionSize,
 		LocalPath:    req.LocalPath,
 		GCSPath:      req.GcsPath,
+		BackupTag:    req.BackupTag,
 		OperationID:  req.LroInput.OperationId,
 	})
 }
@@ -1016,10 +1044,17 @@ type PhysicalRestoreRequest struct {
 	InstanceName string
 	CdbName      string
 	// DOP = degree of parallelism for a restore from a physical backup.
-	Dop       int32
-	LocalPath string
-	GcsPath   string
-	LroInput  *LROInput
+	Dop               int32
+	LocalPath         string
+	GcsPath           string
+	LroInput          *LROInput
+	LogGcsPath        string
+	Incarnation       string
+	BackupIncarnation string
+	StartTime         *timestamppb.Timestamp
+	EndTime           *timestamppb.Timestamp
+	StartScn          int64
+	EndScn            int64
 }
 
 // PhysicalRestore restores an RMAN backup (downloaded from GCS).
@@ -1033,13 +1068,20 @@ func PhysicalRestore(ctx context.Context, r client.Reader, dbClientFactory Datab
 	defer closeConn()
 
 	return backup.PhysicalRestore(ctx, &backup.Params{
-		Client:       dbClient,
-		InstanceName: req.InstanceName,
-		CDBName:      req.CdbName,
-		DOP:          req.Dop,
-		LocalPath:    req.LocalPath,
-		GCSPath:      req.GcsPath,
-		OperationID:  req.LroInput.OperationId,
+		Client:            dbClient,
+		InstanceName:      req.InstanceName,
+		CDBName:           req.CdbName,
+		DOP:               req.Dop,
+		LocalPath:         req.LocalPath,
+		GCSPath:           req.GcsPath,
+		OperationID:       req.LroInput.OperationId,
+		LogGcsDir:         req.LogGcsPath,
+		Incarnation:       req.Incarnation,
+		BackupIncarnation: req.BackupIncarnation,
+		StartTime:         req.StartTime,
+		EndTime:           req.EndTime,
+		StartSCN:          req.StartScn,
+		EndSCN:            req.EndScn,
 	})
 }
 
@@ -1081,7 +1123,7 @@ func CheckStatus(ctx context.Context, r client.Reader, dbClientFactory DatabaseC
 		return nil, fmt.Errorf("config_agent_helpers/CheckStatus: failed to create database daemon client: %v", err)
 	}
 	defer closeConn()
-	klog.V(1).InfoS("config_agent_helpers/CheckStatus", "client", dbClient)
+	klog.V(1).InfoS("config_agent_helpers/CheckStatus: checking if provisioning file exists")
 
 	resp, err := dbClient.FileExists(ctx, &dbdpb.FileExistsRequest{Name: consts.ProvisioningDoneFile})
 	if err != nil {
@@ -1116,7 +1158,19 @@ type DataPumpImportRequest struct {
 	GcsPath string
 	// GCS path to output log file
 	GcsLogPath string
-	LroInput   *LROInput
+	// Additional command options from the user.
+	Options  map[string]string
+	LroInput *LROInput
+}
+
+var AllowedImpdpParams = map[string]bool{
+	"TABLE_EXISTS_ACTION": true,
+	"REMAP_TABLE":         true,
+	"REMAP_SCHEMA":        true,
+	"REMAP_TABLESPACE":    true,
+	"REMAP_DATAFILE":      true,
+	"PARALLEL":            true,
+	"NETWORK_LINK":        true,
 }
 
 // DataPumpImport imports data dump file provided in GCS path.
@@ -1129,17 +1183,26 @@ func DataPumpImport(ctx context.Context, r client.Reader, dbClientFactory Databa
 	}
 	defer func() { _ = closeConn() }()
 
+	commandParams := []string{
+		"FULL=YES",
+		"METRICS=YES",
+		"LOGTIME=ALL",
+	}
+	for k, v := range req.Options {
+		k = strings.ToUpper(k)
+		if _, found := AllowedImpdpParams[k]; found {
+			param := k + "=" + v
+			commandParams = append(commandParams, param)
+		}
+	}
+
 	return dbClient.DataPumpImportAsync(ctx, &dbdpb.DataPumpImportAsyncRequest{
 		SyncRequest: &dbdpb.DataPumpImportRequest{
-			PdbName:    req.PdbName,
-			DbDomain:   req.DbDomain,
-			GcsPath:    req.GcsPath,
-			GcsLogPath: req.GcsLogPath,
-			CommandParams: []string{
-				"FULL=YES",
-				"METRICS=YES",
-				"LOGTIME=ALL",
-			},
+			PdbName:       req.PdbName,
+			DbDomain:      req.DbDomain,
+			GcsPath:       req.GcsPath,
+			GcsLogPath:    req.GcsLogPath,
+			CommandParams: commandParams,
 		},
 		LroInput: &dbdpb.LROInput{
 			OperationId: req.LroInput.OperationId,
@@ -1228,4 +1291,428 @@ func GetParameterTypeValue(ctx context.Context, r client.Reader, dbClientFactory
 	}
 
 	return &GetParameterTypeValueResponse{Types: types, Values: values}, nil
+}
+
+type PhysicalBackupDeleteRequest struct {
+	BackupTag string
+	LocalPath string
+	GcsPath   string
+}
+
+// PhysicalBackupDelete deletes backup data on local or GCS.
+func PhysicalBackupDelete(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req PhysicalBackupDeleteRequest) error {
+	klog.InfoS("config_agent_helpers/PhysicalBackupDelete", "namespace", namespace, "instName", instName, "backupTag", req.BackupTag, "localPath", req.LocalPath, "gcsPath", req.GcsPath)
+
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/PhysicalBackupDelete: failed to create database daemon client: %v", err)
+	}
+	defer closeConn()
+
+	if err := backup.PhysicalBackupDelete(ctx, &backup.Params{
+		Client:    dbClient,
+		LocalPath: req.LocalPath,
+		GCSPath:   req.GcsPath,
+		BackupTag: req.BackupTag,
+	}); err != nil {
+		return fmt.Errorf("config_agent_helpers/PhysicalBackupDelete: failed to delete physical backup: %v", err)
+	}
+
+	return nil
+}
+
+type PhysicalBackupMetadataRequest struct {
+	BackupTag string
+}
+
+type PhysicalBackupMetadataResponse struct {
+	BackupScn         string
+	BackupIncarnation string
+	BackupTimestamp   *timestamppb.Timestamp
+}
+
+// PhysicalBackupMetadata fetches backup scn/timestamp/incarnation with provided backup tag.
+func PhysicalBackupMetadata(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req PhysicalBackupMetadataRequest) (*PhysicalBackupMetadataResponse, error) {
+	klog.InfoS("config_agent_helpers/PhysicalBackupMetadata", "namespace", namespace, "instName", instName, "backupTag", req.BackupTag)
+
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to create database daemon client: %v", err)
+	}
+	defer closeConn()
+
+	// Find the max "Next SCN" in current archivelog backup, this will be the backup scn.
+	// Example of list backup of archivelog output:
+	//  Thrd Seq     Low SCN    Low Time  Next SCN   Next Time
+	//  ---- ------- ---------- --------- ---------- ---------
+	//  1    1       1527386    30-JUL-21 1530961    30-JUL-21
+	listArchiveLogBackupCmd := "list backup of archivelog all tag '%s';"
+	res, err := dbClient.RunRMAN(ctx, &dbdpb.RunRMANRequest{Scripts: []string{fmt.Sprintf(listArchiveLogBackupCmd, req.BackupTag)}})
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to list backup of archivelog: %v", err)
+	}
+
+	var threeLinesBuffer [3]string
+	maxSCN := int64(-1)
+	scanner := bufio.NewScanner(strings.NewReader(res.GetOutput()[0]))
+	for scanner.Scan() {
+		threeLinesBuffer[0] = threeLinesBuffer[1]
+		threeLinesBuffer[1] = threeLinesBuffer[2]
+		threeLinesBuffer[2] = scanner.Text()
+
+		if strings.Contains(threeLinesBuffer[0], "Next SCN") {
+			fields := strings.Fields(threeLinesBuffer[2])
+			if len(fields) != 6 {
+				return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: unexpected number of fields: %v", threeLinesBuffer[2])
+			}
+			currentSCN, err := strconv.ParseInt(fields[4], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to parse 'Next SCN' %v: %v", fields[2], err)
+			}
+			if currentSCN > maxSCN {
+				maxSCN = currentSCN
+			}
+		}
+	}
+
+	if maxSCN < 0 {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to find backup scn")
+	}
+
+	scnToTimestampSQL := "select to_char(scn_to_timestamp(%s) at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as backuptime from dual"
+	backupTimeResp, err := fetchAndParseSingleResultQuery(ctx, dbClient, fmt.Sprintf(scnToTimestampSQL, strconv.FormatInt(maxSCN, 10)))
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to query backup time: %s", err)
+	}
+	if backupTimeResp == "" {
+		return nil, nil
+	}
+	backupTime, err := time.Parse(time.RFC3339, backupTimeResp)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to parse backup time: %s", err)
+	}
+
+	incResp, err := FetchDatabaseIncarnation(ctx, r, dbClientFactory, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/PhysicalBackupMetadata: failed to query database incarnation: %s", err)
+	}
+
+	klog.InfoS("config_agent_helpers/PhysicalBackupMetadata", "backup incarnation", incResp.Incarnation, "backup scn", maxSCN, "backup time", backupTime)
+	return &PhysicalBackupMetadataResponse{
+		BackupIncarnation: incResp.Incarnation,
+		BackupScn:         strconv.FormatInt(maxSCN, 10),
+		BackupTimestamp:   timestamppb.New(backupTime),
+	}, nil
+}
+
+type FetchDatabaseIncarnationResponse struct {
+	Incarnation string
+}
+
+// FetchDatabaseIncarnation fetches the database incarnation number.
+func FetchDatabaseIncarnation(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string) (*FetchDatabaseIncarnationResponse, error) {
+	klog.InfoS("config_agent_helpers/FetchDatabaseIncarnation", "namespace", namespace, "instName", instName)
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	defer func() { _ = closeConn() }()
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/FetchDatabaseIncarnation: failed to create database daemon client: %w", err)
+	}
+	inc, err := fetchAndParseSingleResultQuery(ctx, dbClient, consts.GetDatabaseIncarnationSQL)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/FetchDatabaseIncarnation: failed to query database incarnation: %s", err)
+	}
+	return &FetchDatabaseIncarnationResponse{Incarnation: inc}, nil
+}
+
+type VerifyStandbySettingsRequest struct {
+	PrimaryHost         string
+	PrimaryPort         int32
+	PrimaryService      string
+	PrimaryUser         string
+	PrimaryCredential   *Credential
+	StandbyDbUniqueName string
+	StandbyCdbName      string
+	BackupGcsPath       string
+	PasswordFileGcsPath string
+	StandbyVersion      string
+}
+
+type VerifyStandbySettingsResponse struct {
+	Errors []*standbyhelpers.StandbySettingErr
+}
+
+type Credential struct {
+	// Types that are assignable to Source:
+	//	*Credential_GsmSecretReference
+	Source isCredentialSource
+}
+
+func (x *Credential) GetGsmSecretReference() *GsmSecretReference {
+	if x, ok := x.Source.(*CredentialGsmSecretReference); ok {
+		return x.GsmSecretReference
+	}
+	return nil
+}
+
+type isCredentialSource interface {
+	isCredentialSource()
+}
+
+type CredentialGsmSecretReference struct {
+	GsmSecretReference *GsmSecretReference
+}
+
+func (*CredentialGsmSecretReference) isCredentialSource() {}
+
+// VerifyStandbySettings does preflight checks on standby settings.
+func VerifyStandbySettings(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req VerifyStandbySettingsRequest) (*VerifyStandbySettingsResponse, error) {
+	klog.InfoS("config_agent_helpers/VerifyStandbySettings", "namespace", namespace, "instName", instName, "primaryHost", req.PrimaryHost, "standbyDbUniqueName", req.StandbyDbUniqueName)
+
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/VerifyStandbySettings: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	sa := secret.NewGSMSecretAccessor(
+		req.PrimaryCredential.GetGsmSecretReference().ProjectId,
+		req.PrimaryCredential.GetGsmSecretReference().SecretId,
+		req.PrimaryCredential.GetGsmSecretReference().Version,
+	)
+	defer sa.Clear()
+
+	primaryDB := &standby.Primary{
+		Host:             req.PrimaryHost,
+		Port:             int(req.PrimaryPort),
+		Service:          req.PrimaryService,
+		User:             req.PrimaryUser,
+		PasswordAccessor: sa,
+	}
+
+	standbyDB := &standby.Standby{
+		CDBName:      req.StandbyCdbName,
+		DBUniqueName: req.StandbyDbUniqueName,
+		Version:      req.StandbyVersion,
+	}
+
+	settingErrs := standby.VerifyStandbySettings(ctx, primaryDB, standbyDB, req.PasswordFileGcsPath, req.BackupGcsPath, dbClient)
+	//the returned error is always nil because all the errors that occurred during the verification have been added in settingErrs.
+	return &VerifyStandbySettingsResponse{
+		Errors: settingErrs,
+	}, nil
+}
+
+type CreateStandbyRequest struct {
+	PrimaryHost         string
+	PrimaryPort         int32
+	PrimaryService      string
+	PrimaryUser         string
+	PrimaryCredential   *Credential
+	StandbyDbUniqueName string
+	StandbyLogDiskSize  int64
+	StandbyDbDomain     string
+	BackupGcsPath       string
+	LroInput            *LROInput
+}
+
+// CreateStandby creates a standby database.
+func CreateStandby(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req CreateStandbyRequest) (*lropb.Operation, error) {
+	klog.InfoS("config_agent_helpers/CreateStandby",
+		"namespace", namespace,
+		"instName", instName,
+		"primaryHost", req.PrimaryHost,
+		"primaryPort", req.PrimaryPort,
+		"primaryService", req.PrimaryService,
+		"primaryUser", req.PrimaryUser,
+		"standbyDbUniqueName", req.StandbyDbUniqueName,
+	)
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/CreateStandby: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	sa := secret.NewGSMSecretAccessor(
+		req.PrimaryCredential.GetGsmSecretReference().ProjectId,
+		req.PrimaryCredential.GetGsmSecretReference().SecretId,
+		req.PrimaryCredential.GetGsmSecretReference().Version,
+	)
+	defer sa.Clear()
+
+	primaryDB := &standby.Primary{
+		Host:             req.PrimaryHost,
+		Port:             int(req.PrimaryPort),
+		Service:          req.PrimaryService,
+		User:             req.PrimaryUser,
+		PasswordAccessor: sa,
+	}
+
+	standbyDB := &standby.Standby{
+		DBUniqueName: req.StandbyDbUniqueName,
+		Port:         consts.SecureListenerPort,
+		DBDomain:     req.StandbyDbDomain,
+		LogDiskSize:  req.StandbyLogDiskSize,
+	}
+
+	lro, err := standby.CreateStandby(ctx, primaryDB, standbyDB, req.BackupGcsPath, req.LroInput.OperationId, dbClient)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/CreateStandby: failed to create standby: %v", err)
+	}
+
+	return lro, nil
+}
+
+type SetUpDataGuardRequest struct {
+	PrimaryHost         string
+	PrimaryPort         int32
+	PrimaryService      string
+	PrimaryUser         string
+	PrimaryCredential   *Credential
+	StandbyDbUniqueName string
+	StandbyHost         string
+	PasswordFileGcsPath string
+}
+
+// SetUpDataGuard updates Data Guard configuration.
+func SetUpDataGuard(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req SetUpDataGuardRequest) error {
+	klog.InfoS("config_agent_helpers/SetupDataGuard",
+		"namespace", namespace,
+		"instName", instName,
+		"primaryHost", req.PrimaryHost,
+		"primaryPort", req.PrimaryPort,
+		"primaryService", req.PrimaryService,
+		"primaryUser", req.PrimaryUser,
+		"standbyDbUniqueName", req.StandbyDbUniqueName,
+		"standbyHost", req.StandbyHost,
+	)
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/SetupDataGuard: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	sa := secret.NewGSMSecretAccessor(
+		req.PrimaryCredential.GetGsmSecretReference().ProjectId,
+		req.PrimaryCredential.GetGsmSecretReference().SecretId,
+		req.PrimaryCredential.GetGsmSecretReference().Version,
+	)
+	defer sa.Clear()
+
+	primaryDB := &standby.Primary{
+		Host:             req.PrimaryHost,
+		Port:             int(req.PrimaryPort),
+		Service:          req.PrimaryService,
+		User:             req.PrimaryUser,
+		PasswordAccessor: sa,
+	}
+
+	standbyDB := &standby.Standby{
+		DBUniqueName: req.StandbyDbUniqueName,
+		Host:         req.StandbyHost,
+		Port:         consts.SecureListenerPort,
+	}
+
+	if err := standby.SetUpDataGuard(ctx, primaryDB, standbyDB, req.PasswordFileGcsPath, dbClient); err != nil {
+		return fmt.Errorf("failed to set up Data Guard: %v", err)
+	}
+
+	return nil
+}
+
+type PromoteStandbyRequest struct {
+	PrimaryHost         string
+	PrimaryPort         int32
+	PrimaryService      string
+	PrimaryUser         string
+	PrimaryCredential   *Credential
+	StandbyDbUniqueName string
+	StandbyHost         string
+}
+
+// PromoteStandby promotes standby database to primary.
+func PromoteStandby(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req PromoteStandbyRequest) error {
+	klog.InfoS("config_agent_helpers/PromoteStandby",
+		"namespace", namespace,
+		"instName", instName,
+		"primaryHost", req.PrimaryHost,
+		"primaryPort", req.PrimaryPort,
+		"primaryService", req.PrimaryService,
+		"primaryUser", req.PrimaryUser,
+		"standbyDbUniqueName", req.StandbyDbUniqueName,
+		"standbyHost", req.StandbyHost,
+	)
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return fmt.Errorf("config_agent_helpers/PromoteStandby: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	sa := secret.NewGSMSecretAccessor(
+		req.PrimaryCredential.GetGsmSecretReference().ProjectId,
+		req.PrimaryCredential.GetGsmSecretReference().SecretId,
+		req.PrimaryCredential.GetGsmSecretReference().Version,
+	)
+	defer sa.Clear()
+
+	primaryDB := &standby.Primary{
+		Host:             req.PrimaryHost,
+		Port:             int(req.PrimaryPort),
+		Service:          req.PrimaryService,
+		User:             req.PrimaryUser,
+		PasswordAccessor: sa,
+	}
+
+	standbyDB := &standby.Standby{
+		DBUniqueName: req.StandbyDbUniqueName,
+	}
+
+	if err := standby.PromoteStandby(ctx, primaryDB, standbyDB, dbClient); err != nil {
+		return fmt.Errorf("failed to promote standby: %v", err)
+	}
+
+	return nil
+}
+
+type DataGuardStatusRequest struct {
+	StandbyDbUniqueName string
+}
+
+type DataGuardStatusResponse struct {
+	Output []string
+}
+
+// DataGuardStatus returns Data Guard configuration status and standby DB status.
+func DataGuardStatus(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req DataGuardStatusRequest) (*DataGuardStatusResponse, error) {
+	klog.InfoS("config_agent_helpers/DataGuardStatus", "namespace", namespace, "instName", instName, "standbyDbUniqueName", req.StandbyDbUniqueName)
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/DataGuardStatus: failed to create database daemon dbdClient: %v", err)
+	}
+	defer closeConn()
+
+	output, err := standby.DataGuardStatus(ctx, req.StandbyDbUniqueName, dbClient)
+	return &DataGuardStatusResponse{
+		Output: output,
+	}, err
+}
+
+type ApplyDataPatchRequest struct {
+	LroInput *LROInput
+}
+
+// ApplyDataPatch calls dbdaemon->ApplyDataPatch()
+func ApplyDataPatch(ctx context.Context, r client.Reader, dbClientFactory DatabaseClientFactory, namespace, instName string, req ApplyDataPatchRequest) (*lropb.Operation, error) {
+	klog.InfoS("config_agent_helpersApplyDataPatch", "namespace", namespace, "instName", instName)
+
+	dbClient, closeConn, err := dbClientFactory.New(ctx, r, namespace, instName)
+	if err != nil {
+		return nil, fmt.Errorf("config_agent_helpers/ApplyDataPatch: failed to create database daemon client: %w", err)
+	}
+	defer func() { _ = closeConn() }()
+
+	return dbClient.ApplyDataPatchAsync(ctx, &dbdpb.ApplyDataPatchAsyncRequest{
+		LroInput: &dbdpb.LROInput{
+			OperationId: req.LroInput.OperationId,
+		},
+	})
 }

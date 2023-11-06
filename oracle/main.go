@@ -18,7 +18,9 @@ import (
 	"context"
 	"flag"
 	"os"
+	"sync"
 
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/pitrcontroller"
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/v2/pkg/apis/volumesnapshot/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,7 +36,6 @@ import (
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/backupcontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/backupschedulecontroller"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/configcontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/cronanythingcontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/databasecontroller"
 	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/exportcontroller"
@@ -99,12 +100,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	var locker = sync.Map{}
+
 	if err = (&instancecontroller.InstanceReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("Instance"),
-		Scheme:   mgr.GetScheme(),
-		Images:   images,
-		Recorder: mgr.GetEventRecorderFor("instance-controller"),
+		Client:        mgr.GetClient(),
+		Log:           ctrl.Log.WithName("controllers").WithName("Instance"),
+		SchemeVal:     mgr.GetScheme(),
+		Images:        images,
+		Recorder:      mgr.GetEventRecorderFor("instance-controller"),
+		InstanceLocks: &locker,
 
 		DatabaseClientFactory: &controllers.GRPCDatabaseClientFactory{},
 	}).SetupWithManager(mgr); err != nil {
@@ -116,6 +120,7 @@ func main() {
 		Log:                   ctrl.Log.WithName("controllers").WithName("Database"),
 		Scheme:                mgr.GetScheme(),
 		Recorder:              mgr.GetEventRecorderFor("database-controller"),
+		InstanceLocks:         &locker,
 		DatabaseClientFactory: &controllers.GRPCDatabaseClientFactory{},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Database")
@@ -126,6 +131,7 @@ func main() {
 		Log:                 ctrl.Log.WithName("controllers").WithName("Backup"),
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorderFor("backup-controller"),
+		InstanceLocks:       &locker,
 		OracleBackupFactory: &backupcontroller.RealOracleBackupFactory{},
 		BackupCtrl:          &backupcontroller.RealBackupControl{Client: mgr.GetClient()},
 
@@ -134,21 +140,12 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "Backup")
 		os.Exit(1)
 	}
-	if err = (&configcontroller.ConfigReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("Config"),
-		Scheme:   mgr.GetScheme(),
-		Images:   images,
-		Recorder: mgr.GetEventRecorderFor("config-controller"),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Config")
-		os.Exit(1)
-	}
 	if err = (&exportcontroller.ExportReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("Export"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("export-controller"),
+		Client:        mgr.GetClient(),
+		Log:           ctrl.Log.WithName("controllers").WithName("Export"),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorderFor("export-controller"),
+		InstanceLocks: &locker,
 
 		DatabaseClientFactory: &controllers.GRPCDatabaseClientFactory{},
 	}).SetupWithManager(mgr); err != nil {
@@ -156,14 +153,29 @@ func main() {
 		os.Exit(1)
 	}
 	if err = (&importcontroller.ImportReconciler{
-		Client:   mgr.GetClient(),
-		Log:      ctrl.Log.WithName("controllers").WithName("Import"),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("import-controller"),
+		Client:        mgr.GetClient(),
+		Log:           ctrl.Log.WithName("controllers").WithName("Import"),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorderFor("import-controller"),
+		InstanceLocks: &locker,
 
 		DatabaseClientFactory: &controllers.GRPCDatabaseClientFactory{},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Import")
+		os.Exit(1)
+	}
+	if err = (&pitrcontroller.PITRReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("PITR"),
+		Scheme: mgr.GetScheme(),
+		BackupCtrl: &pitrcontroller.RealBackupControl{
+			Client: mgr.GetClient(),
+		},
+		PITRCtrl: &pitrcontroller.RealPITRControl{
+			Client: mgr.GetClient(),
+		},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "PITR")
 		os.Exit(1)
 	}
 
@@ -187,7 +199,9 @@ func main() {
 		ctrl.Log.WithName("controllers").WithName("CronAnything"),
 		&cronanythingcontroller.RealCronAnythingControl{
 			Client: mgr.GetClient(),
-		})
+		},
+		&locker,
+	)
 	if err != nil {
 		setupLog.Error(err, "unable to init reconciler", "reconciler", "CronAnything")
 		os.Exit(1)

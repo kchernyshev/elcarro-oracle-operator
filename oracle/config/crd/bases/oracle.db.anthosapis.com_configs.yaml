@@ -1,10 +1,9 @@
-
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.5.0
+    controller-gen.kubebuilder.io/version: v0.9.2
   creationTimestamp: null
   name: configs.oracle.db.anthosapis.com
 spec:
@@ -122,6 +121,7 @@ spec:
                             only "value". The requirements are ANDed.
                           type: object
                       type: object
+                      x-kubernetes-map-type: atomic
                     size:
                       anyOf:
                       - type: integer
@@ -175,13 +175,12 @@ spec:
                 type: string
               storageClass:
                 description: Storage class to use for dynamic provisioning. This value
-                  varies depending on a platform. For GCP (and the default) it is
-                  "csi-gce-pd".
+                  varies depending on a platform. For GCP (the default), it is "standard-rwo".
                 type: string
               volumeSnapshotClass:
                 description: Volume Snapshot class to use for storage snapshots. This
-                  value varies depending on a platform. For GCP (and the default)
-                  it is "csi-gce-pd-snapshot-class".
+                  value varies from platform to platform. For GCP (the default), it
+                  is "csi-gce-pd-snapshot-class".
                 type: string
             type: object
           status:
@@ -191,9 +190,3 @@ spec:
     served: true
     storage: true
     subresources: {}
-status:
-  acceptedNames:
-    kind: ""
-    plural: ""
-  conditions: []
-  storedVersions: []

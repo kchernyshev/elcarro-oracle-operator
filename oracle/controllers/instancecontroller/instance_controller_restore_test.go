@@ -7,32 +7,44 @@ import (
 	"strings"
 	"time"
 
-	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
-	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
-	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	commonv1alpha1 "github.com/GoogleCloudPlatform/elcarro-oracle-operator/common/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/api/v1alpha1"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/controllers/testhelpers"
+	dbdpb "github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/agents/oracle"
+	"github.com/GoogleCloudPlatform/elcarro-oracle-operator/oracle/pkg/k8s"
 )
 
 func testInstanceRestore() {
-	const (
-		Namespace    = "default"
-		InstanceName = "test-instance-restore"
 
+	const (
 		timeout  = time.Second * 25
 		interval = time.Millisecond * 15
+	)
+	var (
+		Namespace    string
+		InstanceName string
+		BackupName   string
+		BackupID     string
+		ObjKey       client.ObjectKey
 	)
 
 	var fakeDatabaseClient *testhelpers.FakeDatabaseClient
 	oldPreflightFunc := restorePhysicalPreflightCheck
 
 	BeforeEach(func() {
+		Namespace = "default"
+		InstanceName = testhelpers.RandName("test-instance-restore")
+		BackupName = testhelpers.RandName("test-backup")
+		BackupID = testhelpers.RandName("test-backup-id")
+		ObjKey = client.ObjectKey{Namespace: Namespace, Name: InstanceName}
+
 		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 
 		fakeDatabaseClient.SetAsyncPhysicalRestore(true)
@@ -52,26 +64,23 @@ func testInstanceRestore() {
 		restorePhysicalPreflightCheck = oldPreflightFunc
 	})
 
-	backupName := "test-backup"
-	backupID := "test-backup-id"
-	objKey := client.ObjectKey{Namespace: Namespace, Name: InstanceName}
 	ctx := context.Background()
 	restoreRequestTime := metav1.Now()
 
 	createInstanceAndStartRestore := func(mode testhelpers.FakeOperationStatus) (*v1alpha1.Instance, *v1alpha1.Backup) {
 		instance := createSimpleInstance(ctx, InstanceName, Namespace, timeout, interval)
-		backup := createSimpleRMANBackup(ctx, InstanceName, backupName, backupID, Namespace)
+		backup := createSimpleRMANBackup(ctx, InstanceName, BackupName, BackupID, Namespace)
 
 		By("invoking RMAN restore for the Instance")
 
 		// configure fakeDatabaseClient to be in requested mode
 		fakeDatabaseClient.SetNextGetOperationStatus(mode)
 		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			instance.Spec.Restore = &v1alpha1.RestoreSpec{
-				BackupID:    backupID,
+				BackupID:    BackupID,
 				BackupType:  "Physical",
 				Force:       true,
 				RequestTime: restoreRequestTime,
@@ -89,10 +98,10 @@ func testInstanceRestore() {
 
 		By("verifying restore LRO was started")
 		Eventually(func() (string, error) {
-			return getConditionReason(ctx, objKey, k8s.Ready)
+			return getConditionReason(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(k8s.RestoreInProgress))
 
-		Expect(k8sClient.Get(ctx, objKey, instance)).Should(Succeed())
+		Expect(k8sClient.Get(ctx, ObjKey, instance)).Should(Succeed())
 		Expect(instance.Status.LastRestoreTime).ShouldNot(BeNil())
 		Expect(instance.Status.LastRestoreTime.UnixNano()).Should(Equal(restoreRequestTime.Rfc3339Copy().UnixNano()))
 
@@ -100,7 +109,7 @@ func testInstanceRestore() {
 		fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDone)
 
 		Eventually(func() (metav1.ConditionStatus, error) {
-			return getConditionStatus(ctx, objKey, k8s.Ready)
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
 		// There might be more than one call to DeleteOperation
@@ -110,7 +119,7 @@ func testInstanceRestore() {
 
 		By("checking that instance Restore section is deleted")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if instance.Spec.Restore != nil {
@@ -121,7 +130,7 @@ func testInstanceRestore() {
 
 		By("checking that instance Status.Description is updated")
 		Expect(instance.Status.Description).Should(HavePrefix("Restored on"))
-		Expect(instance.Status.Description).Should(ContainSubstring(backupID))
+		Expect(instance.Status.Description).Should(ContainSubstring(BackupID))
 
 		return instance, backup
 	}
@@ -129,8 +138,8 @@ func testInstanceRestore() {
 	It("it should restore successfully in LRO mode", func() {
 		instance, backup := testCaseHappyPathLRORestore()
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 
 	It("it should NOT attempt to restore with the same RequestTime", func() {
@@ -141,11 +150,11 @@ func testInstanceRestore() {
 
 		By("restoring from same backup with same RequestTime")
 		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			instance.Spec.Restore = &v1alpha1.RestoreSpec{
-				BackupID:    backupID,
+				BackupID:    BackupID,
 				BackupType:  "Physical",
 				Force:       true,
 				RequestTime: restoreRequestTime,
@@ -155,12 +164,12 @@ func testInstanceRestore() {
 
 		By("verifying restore was not run")
 		Eventually(func() (metav1.ConditionStatus, error) {
-			return getConditionStatus(ctx, objKey, k8s.Ready)
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 		Expect(fakeDatabaseClient.PhysicalRestoreAsyncCalledCnt()).Should(Equal(oldPhysicalRestoreCalledCnt))
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 
 	It("it should run new restore with a later RequestTime", func() {
@@ -168,12 +177,13 @@ func testInstanceRestore() {
 		instance, backup := testCaseHappyPathLRORestore()
 
 		// reset method call counters used later
-		fakeDatabaseClient.Reset()
+		fakeDatabaseClientFactory.Reset()
+		fakeDatabaseClient = fakeDatabaseClientFactory.Dbclient
 
 		fakeDatabaseClient.SetMethodToResp("FetchServiceImageMetaData", &dbdpb.FetchServiceImageMetaDataResponse{
-			Version:    "12.2",
+			Version:    "19.3",
 			CdbName:    "GCLOUD",
-			OracleHome: "/u01/app/oracle/product/12.2/db",
+			OracleHome: "/u01/app/oracle/product/19.3/db",
 		})
 		fakeDatabaseClient.SetAsyncPhysicalRestore(true)
 
@@ -182,11 +192,11 @@ func testInstanceRestore() {
 		secondRestoreRequestTime := metav1.NewTime(restoreRequestTime.Rfc3339Copy().Add(time.Second))
 
 		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			instance.Spec.Restore = &v1alpha1.RestoreSpec{
-				BackupID:    backupID,
+				BackupID:    BackupID,
 				BackupType:  "Physical",
 				Force:       true,
 				RequestTime: secondRestoreRequestTime,
@@ -196,12 +206,12 @@ func testInstanceRestore() {
 
 		By("verifying restore was started")
 		Eventually(func() (string, error) {
-			return getConditionReason(ctx, objKey, k8s.Ready)
+			return getConditionReason(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(k8s.RestoreInProgress))
 
 		By("checking that instance maintenance lock is acquired")
 		Eventually(func() string {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return ""
 			}
 			return instance.Status.LockedByController
@@ -210,7 +220,7 @@ func testInstanceRestore() {
 		By("checking that instance is Ready on restore LRO completion")
 		fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusDone)
 		Eventually(func() (metav1.ConditionStatus, error) {
-			return getConditionStatus(ctx, objKey, k8s.Ready)
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 		// There might be more than one call to DeleteOperation
 		// from the reconciler loop with the same LRO id.
@@ -219,11 +229,11 @@ func testInstanceRestore() {
 		Expect(fakeDatabaseClient.PhysicalRestoreAsyncCalledCnt()).Should(Equal(1))
 
 		By("checking Status.LastRestoreTime was updated")
-		Expect(k8sClient.Get(ctx, objKey, instance)).Should(Succeed())
+		Expect(k8sClient.Get(ctx, ObjKey, instance)).Should(Succeed())
 		Expect(instance.Status.LastRestoreTime.UnixNano()).Should(Equal(secondRestoreRequestTime.UnixNano()))
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 
 	It("it should handle failure in LRO operation", func() {
@@ -231,9 +241,9 @@ func testInstanceRestore() {
 		instance, backup := createInstanceAndStartRestore(testhelpers.StatusDoneWithError)
 
 		By("checking that instance has RestoreFailed status")
-		Expect(triggerReconcile(ctx, objKey)).Should(Succeed())
+		Expect(triggerReconcile(ctx, ObjKey)).Should(Succeed())
 		Eventually(func() (string, error) {
-			return getConditionReason(ctx, objKey, k8s.Ready)
+			return getConditionReason(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(k8s.RestoreFailed))
 		// There might be more than one call to DeleteOperation
 		// from the reconciler loop with the same LRO id.
@@ -242,7 +252,7 @@ func testInstanceRestore() {
 
 		By("checking that instance Restore section is deleted")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if instance.Spec.Restore != nil {
@@ -254,25 +264,25 @@ func testInstanceRestore() {
 		By("checking that instance Status.Description is updated")
 		cond := k8s.FindCondition(instance.Status.Conditions, k8s.Ready)
 		Expect(cond.Message).Should(HavePrefix("Failed to restore on"))
-		Expect(cond.Message).Should(ContainSubstring(backupID))
+		Expect(cond.Message).Should(ContainSubstring(BackupID))
 
 		By("checking that instance maintenance lock is released")
 		// Instance object should be fresh at this point, no need to retry
 		Expect(instance.Status.LockedByController).Should(Equal(""))
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 
 	It("it should be able to restore from RestoreFailed state", func() {
 		fakeDatabaseClient.SetAsyncPhysicalRestore(false)
 
 		instance := createSimpleInstance(ctx, InstanceName, Namespace, timeout, interval)
-		backup := createSimpleRMANBackup(ctx, InstanceName, backupName, backupID, Namespace)
+		backup := createSimpleRMANBackup(ctx, InstanceName, BackupName, BackupID, Namespace)
 
 		By("setting Instance as False:RestoreFailed")
 		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			instance.Status = v1alpha1.InstanceStatus{
@@ -299,11 +309,11 @@ func testInstanceRestore() {
 		// configure fakeDatabaseClient to be in requested mode
 		fakeDatabaseClient.SetNextGetOperationStatus(testhelpers.StatusNotFound)
 		Expect(retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			instance.Spec.Restore = &v1alpha1.RestoreSpec{
-				BackupID:    backupID,
+				BackupID:    BackupID,
 				BackupType:  "Physical",
 				Force:       true,
 				RequestTime: restoreRequestTime,
@@ -313,14 +323,14 @@ func testInstanceRestore() {
 
 		By("checking that instance status is Ready")
 		Eventually(func() (metav1.ConditionStatus, error) {
-			return getConditionStatus(ctx, objKey, k8s.Ready)
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
 		Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
 
 		By("checking that instance Restore section is deleted")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if instance.Spec.Restore != nil {
@@ -331,14 +341,14 @@ func testInstanceRestore() {
 
 		By("checking that instance Status.Description is updated")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if !strings.HasPrefix(instance.Status.Description, "Restored on") {
 				return fmt.Errorf("%q does not have expected prefix", instance.Status.Description)
 			}
-			if !strings.Contains(instance.Status.Description, backupID) {
-				return fmt.Errorf("%q does not contain %q", instance.Status.Description, backupID)
+			if !strings.Contains(instance.Status.Description, BackupID) {
+				return fmt.Errorf("%q does not contain %q", instance.Status.Description, BackupID)
 			}
 			return nil
 		}, timeout, interval).Should(Succeed())
@@ -347,8 +357,8 @@ func testInstanceRestore() {
 		// Instance object should be fresh at this point, no need to retry
 		Expect(instance.Status.LockedByController).Should(Equal(""))
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 
 	It("it should restore successfully in sync mode", func() {
@@ -358,14 +368,14 @@ func testInstanceRestore() {
 
 		By("checking that instance status is Ready")
 		Eventually(func() (metav1.ConditionStatus, error) {
-			return getConditionStatus(ctx, objKey, k8s.Ready)
+			return getConditionStatus(ctx, ObjKey, k8s.Ready)
 		}, timeout, interval).Should(Equal(metav1.ConditionTrue))
 
 		Expect(fakeDatabaseClient.DeleteOperationCalledCnt()).Should(Equal(0))
 
 		By("checking that instance Restore section is deleted")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if instance.Spec.Restore != nil {
@@ -376,14 +386,14 @@ func testInstanceRestore() {
 
 		By("checking that instance Status.Description is updated")
 		Eventually(func() error {
-			if err := k8sClient.Get(ctx, objKey, instance); err != nil {
+			if err := k8sClient.Get(ctx, ObjKey, instance); err != nil {
 				return err
 			}
 			if !strings.HasPrefix(instance.Status.Description, "Restored on") {
 				return fmt.Errorf("%q does not have expected prefix", instance.Status.Description)
 			}
-			if !strings.Contains(instance.Status.Description, backupID) {
-				return fmt.Errorf("%q does not contain %q", instance.Status.Description, backupID)
+			if !strings.Contains(instance.Status.Description, BackupID) {
+				return fmt.Errorf("%q does not contain %q", instance.Status.Description, BackupID)
 			}
 			return nil
 		}, timeout, interval).Should(Succeed())
@@ -392,8 +402,8 @@ func testInstanceRestore() {
 		// Instance object should be fresh at this point, no need to retry
 		Expect(instance.Status.LockedByController).Should(Equal(""))
 
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, objKey, instance)
-		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: backupName}, backup)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, ObjKey, instance)
+		testhelpers.K8sDeleteWithRetry(k8sClient, ctx, client.ObjectKey{Namespace: Namespace, Name: BackupName}, backup)
 	})
 }
 

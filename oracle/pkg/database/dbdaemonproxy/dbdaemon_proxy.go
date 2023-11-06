@@ -14,9 +14,9 @@
 
 // Package dbdaemonproxy provides access to the database container.
 // From the security standpoint only the following requests are honored:
-//  - only requests from a localhost
-//  - only requests against predefined database and listener(s)
-//  - only for tightly controlled commands
+//   - only requests from a localhost
+//   - only requests against predefined database and listener(s)
+//   - only for tightly controlled commands
 //
 // All requests are to be logged and audited.
 //
@@ -404,31 +404,6 @@ func (s *Server) ProxyRunInitOracle(ctx context.Context, req *dbdpb.ProxyRunInit
 	return &dbdpb.ProxyRunInitOracleResponse{}, nil
 }
 
-// SetEnv moves/relink oracle config files
-func (s *Server) SetEnv(ctx context.Context, req *dbdpb.SetEnvRequest) (*dbdpb.SetEnvResponse, error) {
-	klog.InfoS("proxy/SetEnv", "req", req)
-	oracleHome := req.GetOracleHome()
-	cdbName := req.GetCdbName()
-	spfile := req.GetSpfilePath()
-	defaultSpfile := filepath.Join(fmt.Sprintf(consts.ConfigDir, consts.DataMount, cdbName), fmt.Sprintf("spfile%s.ora", cdbName))
-
-	// move config files to default locations first
-	if spfile != defaultSpfile {
-		if err := provision.MoveFile(spfile, defaultSpfile); err != nil {
-			return &dbdpb.SetEnvResponse{}, fmt.Errorf("Proxy/SetEnv: failed to move spfile to default location: %v", err)
-		}
-	}
-
-	spfileLink := filepath.Join(oracleHome, "dbs", fmt.Sprintf("spfile%s.ora", cdbName))
-	if _, err := os.Stat(spfileLink); err == nil {
-		os.Remove(spfileLink)
-	}
-	if err := os.Symlink(defaultSpfile, spfileLink); err != nil {
-		return &dbdpb.SetEnvResponse{}, fmt.Errorf("Proxy/SetEnv symlink creation failed for %s: %v", defaultSpfile, err)
-	}
-	return &dbdpb.SetEnvResponse{}, nil
-}
-
 // ProxyFetchServiceImageMetaData returns metadata from the container running the oracledb container
 func (s *Server) ProxyFetchServiceImageMetaData(ctx context.Context, req *dbdpb.ProxyFetchServiceImageMetaDataRequest) (*dbdpb.ProxyFetchServiceImageMetaDataResponse, error) {
 	oracleHome, cdbName, version, err := provision.FetchMetaDataFromImage()
@@ -473,7 +448,8 @@ func (s *Server) SetDnfsState(ctx context.Context, req *dbdpb.SetDnfsStateReques
 	return &dbdpb.SetDnfsStateResponse{}, nil
 }
 
-//Sets Oracle specific environment variables and creates the .env file
+// initializeEnvironment sets Oracle specific environment variables, creates
+// the .env file.
 func initializeEnvironment(s *Server, home string, dbName string) error {
 	s.databaseHome = home
 	s.databaseSid.val = dbName
@@ -512,5 +488,12 @@ func New(hostname, cdbNameFromYaml string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("an error occured while initializing the environment for Oracle: %v", err)
 	}
+
+	if _, err := os.Stat(consts.UnseededImageFile); err == nil {
+		if err := provision.RelinkConfigFiles(oracleHome, cdbNameFromYaml); err != nil {
+			return nil, err
+		}
+	}
+
 	return s, nil
 }
